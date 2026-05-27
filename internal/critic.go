@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -191,23 +192,46 @@ func RunCriticGate(projectDir, missionDir string, verbose *bool, eventCh chan Wo
 		eventCh <- WorkerEvent{Role: "critic", Line: fmt.Sprintf("✓ Mechanical checks: %d passed", mech.Passed)}
 	}
 
-	eventCh <- WorkerEvent{Role: "critic", Line: "▶ Running judgment checks (3 phases in parallel)..."}
-
-	heartbeatStop := make(chan struct{})
-	go criticHeartbeat(eventCh, heartbeatStop)
-
 	phases := []criticPhase{criticPhaseSpec, criticPhaseArch, criticPhaseDecomp}
+	plans, phaseState := buildCriticPhaseExecutionPlan(specDir, missionDir, phases)
 	reports := make([]*CriticReport, len(phases))
 	errs := make([]error, len(phases))
 
+	runCount := 0
+	for _, plan := range plans {
+		if !plan.ReuseCached {
+			runCount++
+		}
+	}
+	switch {
+	case runCount == 0:
+		eventCh <- WorkerEvent{Role: "critic", Line: "▶ Reusing judgment checks from last PASS (inputs unchanged)"}
+	case runCount == len(phases):
+		eventCh <- WorkerEvent{Role: "critic", Line: "▶ Running judgment checks (3 phases in parallel)..."}
+	default:
+		eventCh <- WorkerEvent{Role: "critic", Line: fmt.Sprintf("▶ Running judgment checks (%d/%d phases need rerun)...", runCount, len(phases))}
+	}
+
+	var heartbeatStop chan struct{}
+	if runCount > 0 {
+		heartbeatStop = make(chan struct{})
+		go criticHeartbeat(eventCh, heartbeatStop)
+	}
+
 	var wg sync.WaitGroup
-	for i, p := range phases {
+	for i, plan := range plans {
+		if plan.ReuseCached {
+			reports[i] = plan.CachedReport
+			eventCh <- WorkerEvent{Role: "critic", Line: fmt.Sprintf("[%s] ✓ Reused previous PASS (inputs unchanged)", plan.Phase.ID)}
+			continue
+		}
 		wg.Add(1)
 		go func(i int, p criticPhase) {
 			defer wg.Done()
 			eventCh <- WorkerEvent{Role: "critic", Line: fmt.Sprintf("[%s] ▶ %s phase started", p.ID, p.Name)}
 			prompt := BuildCriticPhasePrompt(specDir, p)
-			rep, err := runCriticPhaseJudgment(p, prompt, projectDir, verbose, eventCh)
+			sessionKey := autonomousSessionKey("critic", "phase-"+p.ID)
+			rep, err := runCriticPhaseJudgment(p, prompt, projectDir, missionDir, sessionKey, verbose, eventCh)
 			reports[i] = rep
 			errs[i] = err
 			if err != nil {
@@ -215,13 +239,18 @@ func RunCriticGate(projectDir, missionDir string, verbose *bool, eventCh chan Wo
 			} else if rep != nil {
 				eventCh <- WorkerEvent{Role: "critic", Line: fmt.Sprintf("[%s] ✓ %s phase done — %s", p.ID, p.Name, rep.Overall)}
 			}
-		}(i, p)
+		}(i, plan.Phase)
 	}
 	wg.Wait()
-	close(heartbeatStop)
+	if heartbeatStop != nil {
+		close(heartbeatStop)
+	}
 
 	report := mergeCriticReports(reports, errs, mech)
 	persistCriticReport(missionDir, report)
+	if err := persistCriticPhaseExecutionState(missionDir, phaseState, plans, reports, errs); err != nil {
+		eventCh <- WorkerEvent{Role: "critic", Line: fmt.Sprintf("⚠ Failed to persist critic phase cache: %v", err)}
+	}
 
 	if report.Overall == "needs-work" {
 		var findings []string
@@ -246,8 +275,8 @@ func RunCriticGate(projectDir, missionDir string, verbose *bool, eventCh chan Wo
 // Kept for the fix-critic flow and for emergency rollback. Will be removed
 // after the split has shipped successfully end-to-end.
 func BuildCriticPrompt(specDir string) string {
-	criticSkill := ReadSkill("mission-critic")
-	missionDir := filepath.Join(specDir, "mission")
+	criticSkill := ReadSkill("quest-critic")
+	missionDir := ResolveArtifactDir(specDir)
 	projectRoot := filepath.Dir(filepath.Dir(filepath.Dir(specDir)))
 
 	priorReports := readLatestCriticReport(missionDir)
@@ -284,7 +313,7 @@ func BuildCriticPrompt(specDir string) string {
 	parts = append(parts,
 		"IMPORTANT: Do NOT narrate, explain, or describe what you are doing. Just act.",
 		"",
-		"You are running the mission-critic skill. Follow it precisely.",
+		"You are running the quest-critic skill. Follow it precisely.",
 		"",
 		"## Skill Reference",
 		"",
@@ -336,51 +365,17 @@ func BuildCriticPrompt(specDir string) string {
 // This mirrors how BuildFixCriticPrompt already runs and is the proven path
 // for fast, deterministic critic output.
 func BuildCriticPhasePrompt(specDir string, phase criticPhase) string {
-	criticSkill := ReadSkill("mission-critic")
-	missionDir := filepath.Join(specDir, "mission")
-	projectRoot := filepath.Dir(filepath.Dir(filepath.Dir(specDir)))
+	criticSkill := ReadSkill("quest-critic")
+	missionDir := ResolveArtifactDir(specDir)
 
 	priorReports := readLatestCriticReport(missionDir)
-
-	// Resolve every artifact to an absolute path + content. Anything missing
-	// is silently dropped so a project without CLAUDE.md or project-context
-	// still produces a usable prompt.
-	type loadedArtifact struct {
-		Path    string
-		Content string
-	}
-	loadArtifact := func(name string) (loadedArtifact, bool) {
-		var abs string
-		switch name {
-		case "CLAUDE.md":
-			abs = filepath.Join(projectRoot, "CLAUDE.md")
-		default:
-			abs = filepath.Join(missionDir, name)
-		}
-		if !fileExists(abs) {
-			return loadedArtifact{}, false
-		}
-		return loadedArtifact{Path: abs, Content: readFileContent(abs)}, true
-	}
-
-	var artifacts []loadedArtifact
-	if criteria := readCriteriaMd(); strings.TrimSpace(criteria) != "" {
-		artifacts = append(artifacts, loadedArtifact{Path: criteriaMdPath(), Content: criteria})
-	}
-	for _, name := range phase.Artifacts {
-		if a, ok := loadArtifact(name); ok {
-			artifacts = append(artifacts, a)
-		}
-	}
-	if local := filepath.Join(missionDir, "critique-criteria.local.md"); fileExists(local) {
-		artifacts = append(artifacts, loadedArtifact{Path: local, Content: readFileContent(local)})
-	}
+	artifacts := loadCriticPhaseArtifacts(specDir, phase)
 
 	var parts []string
 	parts = append(parts,
 		"IMPORTANT: Do NOT narrate, explain, or describe what you are doing. Just emit the JSON.",
 		"",
-		fmt.Sprintf("You are running the mission-critic skill — Phase %s (%s).", phase.ID, phase.Name),
+		fmt.Sprintf("You are running the quest-critic skill — Phase %s (%s).", phase.ID, phase.Name),
 		phase.Focus,
 		"",
 		"## Skill Reference",
@@ -445,7 +440,7 @@ func firstCriterion(label string) string {
 // runCriticPhaseJudgment runs one critic phase end-to-end (prompt + parse +
 // retry). It mirrors runCriticJudgment but prefixes every streamed line with
 // the phase ID so the unified critic log distinguishes the three streams.
-func runCriticPhaseJudgment(phase criticPhase, prompt, projectDir string, verbose *bool, eventCh chan WorkerEvent) (*CriticReport, error) {
+func runCriticPhaseJudgment(phase criticPhase, prompt, projectDir, missionDir, sessionKey string, verbose *bool, eventCh chan WorkerEvent) (*CriticReport, error) {
 	prefix := fmt.Sprintf("[%s] ", phase.ID)
 	emit := func(line string) {
 		eventCh <- WorkerEvent{Role: "critic", Line: prefix + line}
@@ -457,7 +452,7 @@ func runCriticPhaseJudgment(phase criticPhase, prompt, projectDir string, verbos
 		if retry > 0 {
 			emit(fmt.Sprintf("⚠ Retrying judgment (%d/%d)...", retry, maxCriticRetries))
 		}
-		resultText, err := runCriticPhaseSubprocess(prompt, projectDir, verbose, eventCh, prefix)
+		resultText, err := runCriticPhaseSubprocess(prompt, projectDir, missionDir, sessionKey, verbose, eventCh, prefix)
 		if err != nil {
 			lastErr = err
 			emit(fmt.Sprintf("✕ Critic error: %s", err))
@@ -497,7 +492,7 @@ const criticPhaseTimeout = 3 * time.Minute
 // and a hard wall-clock timeout protects against internal reasoning stalls.
 // A timeout surfaces as a real error so the merge step turns it into a
 // synthetic phase-X-error finding instead of leaving the whole gate hanging.
-func runCriticPhaseSubprocess(prompt, projectDir string, verbose *bool, eventCh chan WorkerEvent, prefix string) (string, error) {
+func runCriticPhaseSubprocess(prompt, projectDir, missionDir, sessionKey string, verbose *bool, eventCh chan WorkerEvent, prefix string) (string, error) {
 	claudeCh := make(chan ClaudeStreamMsg, 64)
 	criticArgs := []string{
 		"--allowedTools", "Read",
@@ -522,7 +517,27 @@ func runCriticPhaseSubprocess(prompt, projectDir string, verbose *bool, eventCh 
 		}
 	}
 
-	setCmd(StartClaude(prompt, projectDir, verbose, claudeCh, criticArgs...))
+	lastSessionID := ""
+	if missionDir != "" && sessionKey != "" {
+		state := loadAutonomousRuntimeState(missionDir)
+		lastSessionID = strings.TrimSpace(state.LastSessionIDs[sessionKey])
+	}
+
+	startCritic := func(promptText string, resumeSessionID string) {
+		claudeCh = make(chan ClaudeStreamMsg, 64)
+		if resumeSessionID != "" {
+			setCmd(StartClaude(
+				"An interrupted critic run already has context. Continue from where you left off and output ONLY the JSON result.",
+				projectDir, verbose, claudeCh,
+				"--resume", resumeSessionID,
+				"--max-turns", "3",
+				"--model", "claude-sonnet-4-6",
+			))
+			return
+		}
+		setCmd(StartClaude(promptText, projectDir, verbose, claudeCh, criticArgs...))
+	}
+	startCritic(prompt, lastSessionID)
 
 	// Watchdog: kill the active subprocess if the phase exceeds the timeout.
 	// We close stopWatchdog on success / hard error so the timer goroutine
@@ -541,7 +556,6 @@ func runCriticPhaseSubprocess(prompt, projectDir string, verbose *bool, eventCh 
 	defer close(stopWatchdog)
 
 	var resultText string
-	var lastSessionID string
 	for attempt := 0; ; attempt++ {
 		gotResult := false
 		for msg := range claudeCh {
@@ -551,6 +565,11 @@ func runCriticPhaseSubprocess(prompt, projectDir string, verbose *bool, eventCh 
 			if msg.Done {
 				if msg.SessionID != "" {
 					lastSessionID = msg.SessionID
+					if missionDir != "" && sessionKey != "" {
+						_, _ = updateAutonomousRuntimeState(missionDir, func(state *AutonomousRuntimeState) {
+							state.LastSessionIDs[sessionKey] = msg.SessionID
+						})
+					}
 				}
 				if msg.Err != nil {
 					select {
@@ -566,18 +585,7 @@ func runCriticPhaseSubprocess(prompt, projectDir string, verbose *bool, eventCh 
 						}
 						eventCh <- WorkerEvent{Role: "critic", Line: fmt.Sprintf("%s⚠ Transient error, retrying (%d/%d)%s in %s...", prefix, attempt+1, maxTransientRetries, label, backoff)}
 						time.Sleep(backoff)
-						claudeCh = make(chan ClaudeStreamMsg, 64)
-						if lastSessionID != "" {
-							setCmd(StartClaude(
-								"An API error interrupted your evaluation. Continue from where you left off. Output ONLY the JSON result.",
-								projectDir, verbose, claudeCh,
-								"--resume", lastSessionID,
-								"--max-turns", "3",
-								"--model", "claude-sonnet-4-6",
-							))
-						} else {
-							setCmd(StartClaude(prompt, projectDir, verbose, claudeCh, criticArgs...))
-						}
+						startCritic(prompt, lastSessionID)
 						break
 					}
 					return "", msg.Err
@@ -703,13 +711,22 @@ func RunFixCriticGate(projectDir, missionDir string, fixes []Feature, verbose *b
 	go criticHeartbeat(eventCh, heartbeatStop)
 	defer close(heartbeatStop)
 
+	sessionFeatureID := "fix-gate"
+	if len(fixes) > 0 {
+		sessionFeatureID = strings.TrimSpace(fixes[0].Fixes)
+		if sessionFeatureID == "" {
+			sessionFeatureID = fixes[0].ID
+		}
+	}
+	sessionKey := autonomousSessionKey("fix-critic", sessionFeatureID)
+
 	var report *CriticReport
 	var lastErr error
 	for retry := 0; retry <= maxCriticRetries; retry++ {
 		if retry > 0 {
 			eventCh <- WorkerEvent{Role: "critic", Line: fmt.Sprintf("⚠ Retrying fix critic (%d/%d)...", retry, maxCriticRetries)}
 		}
-		resultText, err := runCriticJudgment(prompt, projectDir, verbose, eventCh)
+		resultText, err := runCriticJudgment(prompt, projectDir, missionDir, sessionKey, verbose, eventCh)
 		if err != nil {
 			lastErr = err
 			eventCh <- WorkerEvent{Role: "critic", Line: fmt.Sprintf("⚠ Fix critic error: %s", err)}
@@ -760,8 +777,8 @@ func RunFixCriticGate(projectDir, missionDir string, fixes []Feature, verbose *b
 }
 
 func BuildFixCriticPrompt(specDir string, fixes []Feature) string {
-	criticSkill := ReadSkill("mission-critic")
-	missionDir := filepath.Join(specDir, "mission")
+	criticSkill := ReadSkill("quest-critic")
+	missionDir := ResolveArtifactDir(specDir)
 
 	contract := readFileContent(filepath.Join(missionDir, "validation-contract.md"))
 	features := readFileContent(filepath.Join(missionDir, "features.json"))
@@ -825,6 +842,10 @@ func criteriaMdPath() string {
 	if err != nil {
 		return ""
 	}
+	questPath := filepath.Join(home, ".claude", "skills", "quest-critic", "CRITERIA.md")
+	if fileExists(questPath) {
+		return questPath
+	}
 	return filepath.Join(home, ".claude", "skills", "mission-critic", "CRITERIA.md")
 }
 
@@ -873,18 +894,37 @@ func ParseCriticReport(text string) *CriticReport {
 // the parallel phase split. Kept because RunFixCriticGate still relies on
 // the monolithic critic prompt for fix features. Will move to a phase-aware
 // flow once the fix-critic side is split too.
-func runCriticJudgment(prompt, projectDir string, verbose *bool, eventCh chan WorkerEvent) (string, error) {
+func runCriticJudgment(prompt, projectDir, missionDir, sessionKey string, verbose *bool, eventCh chan WorkerEvent) (string, error) {
 	claudeCh := make(chan ClaudeStreamMsg, 64)
 	criticArgs := []string{
 		"--allowedTools", "Read",
 		"--max-turns", "6",
 		"--model", "claude-sonnet-4-6",
 	}
-	cmd := StartClaude(prompt, projectDir, verbose, claudeCh, criticArgs...)
-	_ = cmd
+
+	lastSessionID := ""
+	if missionDir != "" && sessionKey != "" {
+		state := loadAutonomousRuntimeState(missionDir)
+		lastSessionID = strings.TrimSpace(state.LastSessionIDs[sessionKey])
+	}
+
+	startCritic := func(promptText string, resumeSessionID string) {
+		claudeCh = make(chan ClaudeStreamMsg, 64)
+		if resumeSessionID != "" {
+			_ = StartClaude(
+				"An interrupted critic run already has context. Continue from where you left off and output ONLY the JSON result.",
+				projectDir, verbose, claudeCh,
+				"--resume", resumeSessionID,
+				"--max-turns", "4",
+				"--model", "claude-sonnet-4-6",
+			)
+			return
+		}
+		_ = StartClaude(promptText, projectDir, verbose, claudeCh, criticArgs...)
+	}
+	startCritic(prompt, lastSessionID)
 
 	var resultText string
-	var lastSessionID string
 	for attempt := 0; ; attempt++ {
 		gotResult := false
 		for msg := range claudeCh {
@@ -894,6 +934,11 @@ func runCriticJudgment(prompt, projectDir string, verbose *bool, eventCh chan Wo
 			if msg.Done {
 				if msg.SessionID != "" {
 					lastSessionID = msg.SessionID
+					if missionDir != "" && sessionKey != "" {
+						_, _ = updateAutonomousRuntimeState(missionDir, func(state *AutonomousRuntimeState) {
+							state.LastSessionIDs[sessionKey] = msg.SessionID
+						})
+					}
 				}
 				if msg.Err != nil {
 					if isTransientError(msg.Err) && attempt < maxTransientRetries {
@@ -904,19 +949,7 @@ func runCriticJudgment(prompt, projectDir string, verbose *bool, eventCh chan Wo
 						}
 						eventCh <- WorkerEvent{Role: "critic", Line: fmt.Sprintf("⚠ Transient error, retrying (%d/%d)%s in %s...", attempt+1, maxTransientRetries, label, backoff)}
 						time.Sleep(backoff)
-						claudeCh = make(chan ClaudeStreamMsg, 64)
-						if lastSessionID != "" {
-							cmd = StartClaude(
-								"An API error interrupted your evaluation. Continue from where you left off. Output ONLY the JSON result.",
-								projectDir, verbose, claudeCh,
-								"--resume", lastSessionID,
-								"--max-turns", "4",
-								"--model", "claude-sonnet-4-6",
-							)
-						} else {
-							cmd = StartClaude(prompt, projectDir, verbose, claudeCh, criticArgs...)
-						}
-						_ = cmd
+						startCritic(prompt, lastSessionID)
 						break
 					}
 					return "", msg.Err
@@ -999,7 +1032,7 @@ func truncateContent(s string, maxChars int) string {
 }
 
 func BuildAutoFixPrompt(report *CriticReport, specDir, projectDir string) string {
-	missionDir := filepath.Join(specDir, "mission")
+	missionDir := ResolveArtifactDir(specDir)
 	projectRoot := filepath.Dir(filepath.Dir(filepath.Dir(specDir)))
 
 	var findings []CriticFinding
@@ -1115,8 +1148,68 @@ func (r *CriticReport) AdvisoryFindings() []CriticFinding {
 	return out
 }
 
+func (r *CriticReport) NormalizedFailureSignature(scope string) string {
+	if r == nil {
+		return strings.TrimSpace(scope) + "|empty-report"
+	}
+
+	scope = strings.TrimSpace(strings.ToLower(scope))
+	criteriaSet := make(map[string]struct{})
+	for _, finding := range r.BlockingFailures() {
+		criterion := strings.TrimSpace(strings.ToLower(finding.Criterion))
+		if criterion == "" {
+			continue
+		}
+		criteriaSet[criterion] = struct{}{}
+	}
+	if len(criteriaSet) == 0 {
+		for _, id := range r.BlockingFindings {
+			criterion := strings.TrimSpace(strings.ToLower(id))
+			if criterion == "" {
+				continue
+			}
+			criteriaSet[criterion] = struct{}{}
+		}
+	}
+	if len(criteriaSet) == 0 {
+		return scope + "|unknown"
+	}
+
+	criteria := make([]string, 0, len(criteriaSet))
+	for criterion := range criteriaSet {
+		criteria = append(criteria, criterion)
+	}
+	sort.Strings(criteria)
+	return scope + "|" + strings.Join(criteria, ",")
+}
+
+func RunCriticBlockingAutoFix(report *CriticReport, specDir, projectDir string, verbose *bool, onLine func(string)) error {
+	prompt := BuildBlockingAutoFixPrompt(report, specDir, projectDir)
+	if strings.TrimSpace(prompt) == "" {
+		return fmt.Errorf("no blocking findings to fix")
+	}
+
+	ch := make(chan ClaudeStreamMsg, 64)
+	_ = StartClaude(prompt, projectDir, verbose, ch,
+		"--allowedTools", "Read,Edit,Write,Bash,Glob,Grep",
+		"--max-turns", "15",
+		"--model", "sonnet",
+	)
+
+	var lastErr error
+	for msg := range ch {
+		if msg.Line != "" && onLine != nil {
+			onLine(msg.Line)
+		}
+		if msg.Done {
+			lastErr = msg.Err
+		}
+	}
+	return lastErr
+}
+
 func BuildBlockingAutoFixPrompt(report *CriticReport, specDir, projectDir string) string {
-	missionDir := filepath.Join(specDir, "mission")
+	missionDir := ResolveArtifactDir(specDir)
 
 	findings := report.BlockingFailures()
 	if len(findings) == 0 {

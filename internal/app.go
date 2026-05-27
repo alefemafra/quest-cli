@@ -53,7 +53,7 @@ type Model struct {
 	claudeSessionID  string
 	claudeResumeHint string
 
-	// v2 spec-to-mission split-call state.
+	// v2 spec-to-quest split-call state.
 	assertionIDs    map[string][]string // produced by GenPhaseAssertions, consumed by GenPhaseFeatures
 	coverageRetries int                 // count of retry-with-feedback attempts in the current phase
 
@@ -176,7 +176,7 @@ func NewModel(dir string, forceSetup bool, specSlug string) Model {
 
 	if specSlug != "" {
 		specDir := filepath.Join(dir, "docs", "specs", specSlug)
-		missionDir := filepath.Join(specDir, "mission")
+		missionDir := ResolveArtifactDir(specDir)
 		state := ReadMissionState(missionDir)
 		if state.Exists {
 			m.activeSpec = &SpecEntry{Slug: specSlug, SpecPath: specDir, Mission: state}
@@ -321,9 +321,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.workerLogs = append(m.workerLogs, fmt.Sprintf("[AUTOFIX] ✕ Error: %v", msg.err))
 				m.criticFailReport = nil
 				m.updateDashboardContent()
-				return m, sendNotification("Mission", "Auto-fix failed")
+				return m, sendNotification("Quest", "Auto-fix failed")
 			}
-			m.workerLogs = append(m.workerLogs, "[AUTOFIX] ✓ Fixes applied — restarting mission...")
+			m.workerLogs = append(m.workerLogs, "[AUTOFIX] ✓ Fixes applied — restarting quest...")
 			m.criticFailReport = nil
 			m.mission = ReadMissionState(m.missionDir)
 			m.updateDashboardContent()
@@ -353,9 +353,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case criticLoopMsg:
+		if !m.inCriticGenerationFlow() {
+			return m, nil
+		}
 		return m.handleCriticLoopMsg(msg)
 
 	case criticFixDoneMsg:
+		if !m.inCriticGenerationFlow() {
+			return m, nil
+		}
 		return m.handleCriticFixDone(msg)
 
 	case advisoryFixDoneMsg:
@@ -536,7 +542,7 @@ func (m Model) handleSpecSelectKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		spec := m.specs[m.specCursor]
 		m.activeSpec = &spec
-		m.missionDir = filepath.Join(spec.SpecPath, "mission")
+		m.missionDir = ResolveArtifactDir(spec.SpecPath)
 		m.mission = spec.Mission
 		m.criticPassed = false
 		m.criticBypassed = false
@@ -562,7 +568,7 @@ func (m Model) handleSpecSelectKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (m Model) specSelectView() string {
 	w := m.width - margin*2
 
-	header := "\n" + m.styles.Title.Render("Mission Control") + "\n"
+	header := "\n" + m.styles.Title.Render("Quest Control") + "\n"
 	sep := m.styles.Separator.Render(strings.Repeat("─", w))
 
 	var sb strings.Builder
@@ -1075,10 +1081,10 @@ func (m Model) generateMissionFromSpec(spec SpecEntry) (tea.Model, tea.Cmd) {
 	m.criticBypassed = false
 	m.criticLoopCount = 0
 
-	hasExistingAnalysis := fileExists(filepath.Join(spec.SpecPath, "mission", "codebase-analysis.md"))
+	hasExistingAnalysis := fileExists(filepath.Join(ResolveArtifactDir(spec.SpecPath), "codebase-analysis.md"))
 
 	m.discoveryMsgs = []ChatMessage{
-		{Role: "system", Text: fmt.Sprintf("Preparing mission plan for %s", spec.Slug)},
+		{Role: "system", Text: fmt.Sprintf("Preparing quest plan for %s", spec.Slug)},
 		{Role: "system", Text: "This will analyze your codebase and generate the execution plan."},
 		{Role: "system", Text: "Estimated time: 5-10 minutes across 4 phases."},
 		{Role: "system", Text: ""},
@@ -1152,7 +1158,7 @@ func (m Model) retryGenPhase(reason string) (tea.Model, tea.Cmd) {
 	m.discoveryMsgs = append(m.discoveryMsgs, ChatMessage{Role: "system", Text: fmt.Sprintf("✕ %s — failed after %d retries", reason, m.claudeRetries)})
 	m.viewport.SetContent(m.renderChatContent())
 	m.viewport.GotoBottom()
-	return m, sendNotification("Mission", fmt.Sprintf("Phase failed after %d retries: %s", m.claudeRetries, reason))
+	return m, sendNotification("Quest", fmt.Sprintf("Phase failed after %d retries: %s", m.claudeRetries, reason))
 }
 
 func (m Model) nextGenPhase(result string) (tea.Model, tea.Cmd) {
@@ -1167,7 +1173,7 @@ func (m Model) nextGenPhase(result string) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	mDir := filepath.Join(specPath, "mission")
+	mDir := ResolveArtifactDir(specPath)
 	os.MkdirAll(mDir, 0o755)
 	projectDir := m.projectDir
 	verboseVal := m.verbose
@@ -1417,7 +1423,7 @@ func (m Model) finalizeGeneration(specPath, mDir string) (tea.Model, tea.Cmd) {
 		m.discoveryMsgs = append(m.discoveryMsgs, ChatMessage{Role: "system", Text: "✕ No features available — plan generation failed"})
 		m.viewport.SetContent(m.renderChatContent())
 		m.viewport.GotoBottom()
-		return m, sendNotification("Mission", "Plan generation failed — no features parsed")
+		return m, sendNotification("Quest", "Plan generation failed — no features parsed")
 	}
 
 	project := extractSpecTitle(specPath)
@@ -1464,7 +1470,7 @@ func (m Model) regenMissionPlan() (tea.Model, tea.Cmd) {
 	m.claudeRunning = true
 	m.claudeStartTime = time.Now()
 	m.editingSpec = true
-	m.discoveryMsgs = []ChatMessage{{Role: "system", Text: fmt.Sprintf("Regenerating mission plan for %s (preserving completed work)...", spec.Slug)}}
+	m.discoveryMsgs = []ChatMessage{{Role: "system", Text: fmt.Sprintf("Regenerating quest plan for %s (preserving completed work)...", spec.Slug)}}
 	m.streamLines = nil
 	m.claudeRetries = 0
 	m.claudeSessionID = ""
@@ -1565,7 +1571,7 @@ func (m Model) approveRequirements() (tea.Model, tea.Cmd) {
 	m.claudeResumeHint = ""
 	m.claudeCmd = StartClaude(m.lastPrompt, m.projectDir, &m.verbose, ch)
 
-	m.discoveryMsgs = append(m.discoveryMsgs, ChatMessage{Role: "system", Text: "Requirements approved. Generating mission plan..."})
+	m.discoveryMsgs = append(m.discoveryMsgs, ChatMessage{Role: "system", Text: "Requirements approved. Generating quest plan..."})
 	m.viewport.SetContent(m.renderChatContent())
 	m.viewport.GotoBottom()
 
@@ -1619,6 +1625,7 @@ func (m Model) approvePlan() (tea.Model, tea.Cmd) {
 	m.logFilter = -1
 
 	pool := NewWorkerPool(m.projectDir, m.missionDir, pending, logger, &m.verbose)
+	pool.autonomousMode = true
 	m.workerPool = pool
 
 	m.updateDashboardContent()
@@ -1627,6 +1634,7 @@ func (m Model) approvePlan() (tea.Model, tea.Cmd) {
 
 func (m Model) startWorkers() (tea.Model, tea.Cmd) {
 	m.mission = ReadMissionState(m.missionDir)
+	m.resetCriticGenerationState()
 
 	// If the critic already passed during plan generation OR the user
 	// explicitly approved running without the critic gate, skip the gate
@@ -1652,6 +1660,7 @@ func (m Model) startWorkers() (tea.Model, tea.Cmd) {
 	m.logFilter = -1
 
 	pool := NewWorkerPool(m.projectDir, m.missionDir, pending, logger, &m.verbose)
+	pool.autonomousMode = true
 	m.workerPool = pool
 
 	m.updateDashboardContent()
@@ -1705,6 +1714,7 @@ func (m Model) startAutoFix() (tea.Model, tea.Cmd) {
 
 func (m Model) startWorkersSkipCritic() (tea.Model, tea.Cmd) {
 	m.mission = ReadMissionState(m.missionDir)
+	m.resetCriticGenerationState()
 	m.criticBypassed = true
 
 	var pending []Feature
@@ -1725,6 +1735,7 @@ func (m Model) startWorkersSkipCritic() (tea.Model, tea.Cmd) {
 
 	pool := NewWorkerPool(m.projectDir, m.missionDir, pending, logger, &m.verbose)
 	pool.skipCritic = true
+	pool.autonomousMode = true
 	m.workerPool = pool
 
 	m.updateDashboardContent()
@@ -1757,7 +1768,7 @@ func (m Model) startCriticLoop() (tea.Model, tea.Cmd) {
 	go func() {
 		eventCh := make(chan WorkerEvent, 64)
 
-		go RunCriticGate(projectDir, filepath.Join(specDir, "mission"), &verbose, eventCh)
+		go RunCriticGate(projectDir, ResolveArtifactDir(specDir), &verbose, eventCh)
 
 		var report *CriticReport
 		var verdict string
@@ -1799,6 +1810,10 @@ func (m Model) startCriticLoop() (tea.Model, tea.Cmd) {
 }
 
 func (m Model) handleCriticLoopMsg(msg criticLoopMsg) (tea.Model, tea.Cmd) {
+	if !m.inCriticGenerationFlow() {
+		return m, nil
+	}
+
 	m.claudeRunning = false
 	m.criticStreamCh = nil
 	elapsed := time.Since(m.claudeStartTime).Round(time.Second)
@@ -1878,37 +1893,24 @@ func (m Model) startCriticFix(report *CriticReport) (tea.Model, tea.Cmd) {
 	doneCh := make(chan criticFixDoneMsg, 1)
 
 	go func() {
-		prompt := BuildBlockingAutoFixPrompt(report, specDir, projectDir)
-		if prompt == "" {
-			close(streamCh)
-			doneCh <- criticFixDoneMsg{err: fmt.Errorf("no blocking findings to fix")}
-			return
-		}
-		ch := make(chan ClaudeStreamMsg, 64)
 		v := true
-		_ = StartClaude(prompt, projectDir, &v, ch,
-			"--allowedTools", "Read,Edit,Write,Bash,Glob,Grep",
-			"--max-turns", "15",
-			"--model", "sonnet",
-		)
-		var lastErr error
-		for msg := range ch {
-			if msg.Done {
-				lastErr = msg.Err
-				break
+		err := RunCriticBlockingAutoFix(report, specDir, projectDir, &v, func(line string) {
+			if line != "" {
+				streamCh <- criticStreamMsg{line: line}
 			}
-			if msg.Line != "" {
-				streamCh <- criticStreamMsg{line: msg.Line}
-			}
-		}
+		})
 		close(streamCh)
-		doneCh <- criticFixDoneMsg{err: lastErr}
+		doneCh <- criticFixDoneMsg{err: err}
 	}()
 
 	return m, tea.Batch(listenCriticStream(streamCh), listenCriticFixDone(doneCh), m.spinner.Tick)
 }
 
 func (m Model) handleCriticFixDone(msg criticFixDoneMsg) (tea.Model, tea.Cmd) {
+	if !m.inCriticGenerationFlow() {
+		return m, nil
+	}
+
 	m.claudeRunning = false
 	m.criticStreamCh = nil
 	elapsed := time.Since(m.claudeStartTime).Round(time.Second)
@@ -1956,11 +1958,12 @@ func (m Model) transitionToReview() (tea.Model, tea.Cmd) {
 	m.viewport.SetContent(m.renderChatContent())
 	m.viewport.GotoBottom()
 
-	return m, sendNotification("Mission", fmt.Sprintf("Plan ready — %d features", len(m.mission.Features)))
+	return m, sendNotification("Quest", fmt.Sprintf("Plan ready — %d features", len(m.mission.Features)))
 }
 
 func (m Model) startWorkersAfterCritic() (tea.Model, tea.Cmd) {
 	m.mission = ReadMissionState(m.missionDir)
+	m.resetCriticGenerationState()
 
 	var pending []Feature
 	for _, f := range m.mission.Features {
@@ -1983,10 +1986,25 @@ func (m Model) startWorkersAfterCritic() (tea.Model, tea.Cmd) {
 
 	pool := NewWorkerPool(m.projectDir, m.missionDir, pending, logger, &m.verbose)
 	pool.skipCritic = true
+	pool.autonomousMode = true
 	m.workerPool = pool
 
 	m.updateDashboardContent()
 	return m, tea.Batch(pool.Start(), m.spinner.Tick)
+}
+
+func (m Model) inCriticGenerationFlow() bool {
+	if m.phase != PhaseRunning {
+		return false
+	}
+	return m.genPhase == GenPhaseCritic || m.genPhase == GenPhaseFixLoop
+}
+
+func (m *Model) resetCriticGenerationState() {
+	m.phase = PhaseDashboard
+	m.genPhase = GenPhaseNone
+	m.criticLoopCh = nil
+	m.criticStreamCh = nil
 }
 
 func (m Model) startAdvisoryFix(findings []CriticFinding) (tea.Model, tea.Cmd) {
@@ -2330,7 +2348,7 @@ func (m Model) handleClaudeStream(msg ClaudeStreamMsg) (tea.Model, tea.Cmd) {
 			m.input.Focus()
 		case PhaseRunning:
 			m.discoveryMsgs = append(m.discoveryMsgs, ChatMessage{Role: "system", Text: errMsg})
-			notifyCmd = sendNotification("Mission", fmt.Sprintf("Generation failed: %s", msg.Err))
+			notifyCmd = sendNotification("Quest", fmt.Sprintf("Generation failed: %s", msg.Err))
 		case PhaseReview:
 			m.reviewChat = append(m.reviewChat, ChatMessage{Role: "system", Text: errMsg})
 			m.isRefining = false
@@ -2367,7 +2385,7 @@ func (m Model) handleClaudeStream(msg ClaudeStreamMsg) (tea.Model, tea.Cmd) {
 
 			if plan == nil || len(plan.Features) == 0 {
 				if m.editingSpec && m.activeSpec != nil {
-					mDir := filepath.Join(m.activeSpec.SpecPath, "mission")
+					mDir := ResolveArtifactDir(m.activeSpec.SpecPath)
 					state := ReadMissionState(mDir)
 					if state.Exists && len(state.Features) > 0 {
 						m.missionDir = mDir
@@ -2376,7 +2394,7 @@ func (m Model) handleClaudeStream(msg ClaudeStreamMsg) (tea.Model, tea.Cmd) {
 						m.phase = PhaseReview
 						m.reviewTab = ReviewTabChat
 						m.reviewInput.Focus()
-						m.discoveryMsgs = append(m.discoveryMsgs, ChatMessage{Role: "system", Text: fmt.Sprintf("✓ Mission recovered from disk — %d features", len(state.Features))})
+						m.discoveryMsgs = append(m.discoveryMsgs, ChatMessage{Role: "system", Text: fmt.Sprintf("✓ Quest recovered from disk — %d features", len(state.Features))})
 						m.updateReviewContent()
 						m.viewport.SetContent(m.renderChatContent())
 						m.viewport.GotoBottom()
@@ -2389,10 +2407,10 @@ func (m Model) handleClaudeStream(msg ClaudeStreamMsg) (tea.Model, tea.Cmd) {
 				var specDir, missionDir string
 				if m.editingSpec && m.activeSpec != nil {
 					specDir = m.activeSpec.SpecPath
-					missionDir = filepath.Join(specDir, "mission")
+					missionDir = ResolveArtifactDir(specDir)
 				} else {
 					specDir = filepath.Join(m.projectDir, "docs", "specs", plan.Slug)
-					missionDir = filepath.Join(specDir, "mission")
+					missionDir = ResolveArtifactDir(specDir)
 				}
 				_ = WriteMissionFiles(specDir, m.projectDir, *plan)
 				m.missionDir = missionDir
@@ -2420,7 +2438,7 @@ func (m Model) handleClaudeStream(msg ClaudeStreamMsg) (tea.Model, tea.Cmd) {
 				m.discoveryMsgs = append(m.discoveryMsgs, ChatMessage{Role: "system", Text: fmt.Sprintf("✕ Could not parse plan after %d attempts.", m.claudeRetries)})
 				m.viewport.SetContent(m.renderChatContent())
 				m.viewport.GotoBottom()
-				return m, sendNotification("Mission", fmt.Sprintf("Failed to parse plan after %d attempts", m.claudeRetries))
+				return m, sendNotification("Quest", fmt.Sprintf("Failed to parse plan after %d attempts", m.claudeRetries))
 			}
 			m.viewport.SetContent(m.renderChatContent())
 			m.viewport.GotoBottom()
@@ -2478,6 +2496,8 @@ func (m Model) handleWorkerEvent(ev WorkerEvent) (tea.Model, tea.Cmd) {
 		switch {
 		case ev.Role == "critic":
 			prefix = "[CRITIC]"
+		case ev.Role == "critic-fix":
+			prefix = "[AUTOFIX]"
 		case ev.Role == "validator" && ev.FeatureID != "":
 			prefix = fmt.Sprintf("[VALIDATOR:%s]", ev.FeatureID)
 		case ev.Role == "refinement" && ev.FeatureID != "":
@@ -2604,7 +2624,7 @@ func (m Model) chatView() string {
 	w := m.width - margin*2
 
 	// Header
-	header := "\n" + m.styles.Title.Render("Mission Control")
+	header := "\n" + m.styles.Title.Render("Quest Control")
 	if m.claudeRunning {
 		header += " " + m.spinner.View()
 	}
@@ -2808,7 +2828,7 @@ func (m Model) renderSystemMsg(text string) string {
 			elapsed := parts[1]
 			detail := parts[2]
 			return "\n" +
-				m.styles.Green.Render("  ✓ Mission plan ready") + " " +
+				m.styles.Green.Render("  ✓ Quest plan ready") + " " +
 				m.styles.Yellow.Render(elapsed) + " " +
 				m.styles.Dim.Render("— "+detail) + "\n"
 		}
@@ -3348,7 +3368,9 @@ func (m Model) renderExecutingOverview(totalW, leftW, rightW, leftInner, rightIn
 	logWrap := lipgloss.NewStyle().Width(rightInner)
 	for _, line := range m.workerLogs[start:] {
 		var renderStyle lipgloss.Style
-		if strings.Contains(line, "✓") {
+		if strings.HasPrefix(line, "[AUTOFIX]") {
+			renderStyle = m.styles.Magenta
+		} else if strings.Contains(line, "✓") {
 			renderStyle = m.styles.Green
 		} else if strings.Contains(line, "✕") {
 			renderStyle = m.styles.Red
@@ -3716,7 +3738,7 @@ func (m Model) renderDiagramTab() string {
 func (m Model) dashboardView() string {
 	w := m.width - margin*2
 
-	header := "\n" + m.styles.Title.Render("Mission Control")
+	header := "\n" + m.styles.Title.Render("Quest Control")
 	specLabel := m.mission.Project
 	if m.activeSpec != nil {
 		specLabel = m.activeSpec.Slug
@@ -3783,7 +3805,7 @@ func (m Model) dashboardView() string {
 		hintText = "  " + strings.Join(parts, " · ")
 	}
 	if m.confirmRegen {
-		hintText = "  ⚠ Regenerate mission plan? Completed features will be preserved. (Y: confirm · any key: cancel)"
+		hintText = "  ⚠ Regenerate quest plan? Completed features will be preserved. (Y: confirm · any key: cancel)"
 	}
 	if m.confirmFullReset == 1 {
 		hintText = "  ⚠ Full reset will clear fix_features and reset all root features to pending. (Y: continue · any key: cancel)"
