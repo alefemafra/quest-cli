@@ -52,9 +52,15 @@ type Feature struct {
 	Status         string   `json:"status"`
 	DependsOn      []string `json:"depends_on"`
 	Scope          string   `json:"scope"`
+	Description    string   `json:"description,omitempty"`
 	ValidationRefs []string `json:"validation_refs"`
 	Fixes          string   `json:"fixes,omitempty"`
 	Addresses      []string `json:"addresses,omitempty"`
+	RootCauseHypothesis string   `json:"root_cause_hypothesis,omitempty"`
+	Evidence            []string `json:"evidence,omitempty"`
+	DoneWhen            []string `json:"done_when,omitempty"`
+	NonGoals            []string `json:"non_goals,omitempty"`
+	RegressionGuards    []string `json:"regression_guards,omitempty"`
 	Resolution     string   `json:"resolution,omitempty"`
 	ResolvedBy     string   `json:"resolved_by,omitempty"`
 	ResolvedAt     string   `json:"resolved_at,omitempty"`
@@ -64,6 +70,24 @@ type Feature struct {
 type Assertion struct {
 	Category string   `json:"category"`
 	Items    []string `json:"items"`
+}
+
+// AssertionDeltaItem is the compact unit used by Changes mode (C) to update
+// validation-contract assertions without regenerating the entire document.
+type AssertionDeltaItem struct {
+	ID        string `json:"id"`
+	Category  string `json:"category"`
+	Assertion string `json:"assertion"`
+}
+
+type AssertionDelta struct {
+	Upsert []AssertionDeltaItem `json:"upsert"`
+	Remove []string             `json:"remove"`
+}
+
+type FeatureDelta struct {
+	Upsert []Feature `json:"upsert"`
+	Remove []string  `json:"remove"`
 }
 
 type PlanData struct {
@@ -90,11 +114,13 @@ type QuestStats struct {
 	Done               int
 	DoneDirect         int
 	DoneViaFix         int
+	DoneWaived         int
 	InProgress         int
 	Blocked            int
 	BlockedUnresolved  int
 	BlockedResolved    int
 	BlockedTainted     int
+	BlockedWaived      int
 	Pending            int
 	AwaitingValidation int
 	Validating         int

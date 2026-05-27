@@ -37,9 +37,15 @@ For each `FAIL` or `BLOCKED` assertion:
      "status": "pending",
      "depends_on": ["F02"],
      "scope": "<what needs to be done, minimum scope>",
+     "description": "<context and boundaries for implementation>",
      "validation_refs": ["<assertions that must return to PASS>"],
      "fixes": "F02",
-     "addresses": ["api.4", "ui.5"]
+     "addresses": ["api.4", "ui.5"],
+     "root_cause_hypothesis": "<most likely root cause>",
+     "evidence": ["validator evidence line 1", "repro note 2"],
+     "done_when": ["observable completion criterion 1", "criterion 2"],
+     "non_goals": ["what this fix must not change"],
+     "regression_guards": ["test/scenario that must be added or validated"]
    }
    ```
 
@@ -53,6 +59,8 @@ For each `FAIL` or `BLOCKED` assertion:
 - **Traceability**: `fixes` (which feature) and `addresses` (which assertions) fields filled.
 - **Relative independence**: ideally does not introduce new dependencies on features not yet done. If it does, declare in `depends_on`.
 - **Testable**: the assertions in `validation_refs` must be the SAME ones that failed.
+- **Root-cause discipline**: `root_cause_hypothesis` + `evidence` must justify why this fix exists.
+- **Exit criteria clarity**: `done_when` and `regression_guards` must make success observable.
 
 ## Output
 

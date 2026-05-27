@@ -11,6 +11,7 @@ const (
 	ResolutionOpen            = "open"
 	ResolutionResolvedViaFix  = "resolved_via_fix"
 	ResolutionResolvedTainted = "resolved_tainted"
+	ResolutionWaivedContract  = "waived_contract"
 	ResolutionUnresolved      = "unresolved"
 )
 
@@ -88,6 +89,19 @@ func (r *outcomeResolver) resolve(featureID string) FeatureOutcome {
 		r.memo[featureID] = out
 		return out
 	case "blocked":
+		if strings.TrimSpace(f.Resolution) == ResolutionWaivedContract {
+			out := FeatureOutcome{
+				EffectiveDone: true,
+				Resolution:    ResolutionWaivedContract,
+				ResolvedBy:    featureID,
+				Tainted:       r.tainted[featureID],
+			}
+			if out.Tainted {
+				out.Resolution = ResolutionResolvedTainted
+			}
+			r.memo[featureID] = out
+			return out
+		}
 		children := r.fixesByRoot[featureID]
 		if len(children) == 0 {
 			out := FeatureOutcome{EffectiveDone: false, Resolution: ResolutionUnresolved}

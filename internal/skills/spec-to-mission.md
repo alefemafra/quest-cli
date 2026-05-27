@@ -143,6 +143,7 @@ Output ONLY a valid JSON object. No markdown, no explanation, no code fences.
       "phase": 0,
       "depends_on": [],
       "scope": "<detailed — specific enough for a worker with NO prior context>",
+      "description": "<why this feature exists, constraints, and execution notes>",
       "validation_refs": ["data.1", "data.2"]
     }
   ],
@@ -169,6 +170,7 @@ Output ONLY a valid JSON object. No markdown, no explanation, no code fences.
 - Every assertion must be referenced by at least one feature's `validation_refs`
 - Every feature must have at least one `validation_refs` entry
 - Feature `scope` must be detailed enough for a worker with no context
+- Feature `description` must explain intent, boundaries, and failure-prone edges
 - `depends_on` must be accurate — if F04 uses hooks from F03, declare it
 - Output ONLY the JSON — no markdown, no prose, no fences
 

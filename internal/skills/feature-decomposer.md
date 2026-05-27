@@ -35,6 +35,7 @@ Adjust the number and granularity to match the spec's complexity. A 5-FR spec ne
 ## Feature Scope
 
 Feature scope must be SPECIFIC — detailed enough that a worker with NO prior context can implement it by reading only the scope + spec + validation contract.
+Also provide a `description` field with intent, boundaries, and tricky cases so workers avoid over/under-implementation.
 
 BAD: "Implement step 1 of the wizard"
 GOOD: "RHF form with Zod resolver for EventBasicsSchema (name, slug, description). Auto-derive slug from name. Validation on required fields."
@@ -44,9 +45,10 @@ GOOD: "RHF form with Zod resolver for EventBasicsSchema (name, slug, description
 Output ONLY a valid JSON object — no markdown, no explanation, no code fences.
 
 ```
-{"features":[{"id":"F01","title":"...","phase":0,"depends_on":[],"scope":"...","validation_refs":["data.1","data.2"]}]}
+{"features":[{"id":"F01","title":"...","phase":0,"depends_on":[],"scope":"...","description":"...","validation_refs":["data.1","data.2"]}]}
 ```
 
 - Feature ID format: F01, F02, etc.
 - `validation_refs` MUST reference assertion IDs from the compact list provided.
 - Every assertion should be referenced by at least one feature.
+- Every feature MUST include non-empty `description`.

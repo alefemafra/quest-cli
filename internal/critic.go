@@ -414,8 +414,18 @@ func BuildCriticPhasePrompt(specDir string, phase criticPhase) string {
 		"Do NOT re-run run-mechanical.mjs or evaluate any [M-*] criteria yourself.",
 		"",
 		fmt.Sprintf("Evaluate ONLY the %s judgment criteria for Phase %s. Skip every other phase's criteria.", phase.Criteria, phase.ID),
+		"If prior reports mention feature IDs, treat done/validated features as historical context only — do NOT open new findings against terminal work.",
 		"For each judgment criterion, emit pass or needs-work with concrete suggestions.",
 		"",
+	)
+	if phase.ID == criticPhaseDecomp.ID {
+		parts = append(parts,
+			"For Phase C decomposition checks, ignore features already in terminal status (done/validated).",
+			"Judge only new or non-terminal features that still represent pending implementation work.",
+			"",
+		)
+	}
+	parts = append(parts,
 		"## Output",
 		"",
 		"Output ONLY a valid JSON object matching this schema:",
@@ -461,6 +471,12 @@ func runCriticPhaseJudgment(phase criticPhase, prompt, projectDir, missionDir, s
 		lastErr = nil
 		report = ParseCriticReport(resultText)
 		if report != nil {
+			report = sanitizeCriticReportForPhase(report, phase.ID)
+			if len(report.Findings) == 0 {
+				report = nil
+				emit("⚠ Critic returned no findings for this phase after sanitization; retrying")
+				continue
+			}
 			break
 		}
 		if retry < maxCriticRetries {
@@ -478,6 +494,107 @@ func runCriticPhaseJudgment(phase criticPhase, prompt, projectDir, missionDir, s
 		report.Phase = phase.ID
 	}
 	return report, nil
+}
+
+func sanitizeCriticReportForPhase(report *CriticReport, phaseID string) *CriticReport {
+	if report == nil {
+		return nil
+	}
+	phaseID = strings.ToUpper(strings.TrimSpace(phaseID))
+	prefix := phaseCriterionPrefix(phaseID)
+	if prefix == "" {
+		cloned := *report
+		return &cloned
+	}
+
+	cloned := *report
+	cloned.Phase = phaseID
+	cloned.Findings = sanitizePhaseFindings(cloned.Findings, prefix)
+	cloned.BlockingFindings = sanitizeBlockingFindings(cloned.Findings)
+	if hasNeedsWorkFinding(cloned.Findings) {
+		cloned.Overall = "needs-work"
+	} else {
+		cloned.Overall = "pass"
+	}
+	return &cloned
+}
+
+func phaseCriterionPrefix(phaseID string) string {
+	switch strings.ToUpper(strings.TrimSpace(phaseID)) {
+	case "A":
+		return "J-S"
+	case "B":
+		return "J-A"
+	case "C":
+		return "J-D"
+	default:
+		return ""
+	}
+}
+
+func sanitizePhaseFindings(findings []CriticFinding, prefix string) []CriticFinding {
+	type scoredFinding struct {
+		finding CriticFinding
+		score   int
+	}
+	byCriterion := make(map[string]scoredFinding)
+
+	for _, finding := range findings {
+		criterion := strings.ToUpper(strings.TrimSpace(finding.Criterion))
+		if !strings.HasPrefix(criterion, prefix) {
+			continue
+		}
+		finding.Criterion = criterion
+		score := 0
+		if strings.EqualFold(strings.TrimSpace(finding.Status), "needs-work") {
+			score = 1
+		}
+		existing, ok := byCriterion[criterion]
+		if !ok || score > existing.score {
+			byCriterion[criterion] = scoredFinding{finding: finding, score: score}
+		}
+	}
+
+	keys := make([]string, 0, len(byCriterion))
+	for criterion := range byCriterion {
+		keys = append(keys, criterion)
+	}
+	sort.Strings(keys)
+
+	sanitized := make([]CriticFinding, 0, len(keys))
+	for _, criterion := range keys {
+		sanitized = append(sanitized, byCriterion[criterion].finding)
+	}
+	return sanitized
+}
+
+func sanitizeBlockingFindings(findings []CriticFinding) []string {
+	seen := make(map[string]struct{})
+	blocking := make([]string, 0, len(findings))
+	for _, finding := range findings {
+		if !strings.EqualFold(strings.TrimSpace(finding.Status), "needs-work") {
+			continue
+		}
+		criterion := strings.ToUpper(strings.TrimSpace(finding.Criterion))
+		if criterion == "" {
+			continue
+		}
+		if _, ok := seen[criterion]; ok {
+			continue
+		}
+		seen[criterion] = struct{}{}
+		blocking = append(blocking, criterion)
+	}
+	return blocking
+}
+
+func hasNeedsWorkFinding(findings []CriticFinding) bool {
+	for _, finding := range findings {
+		if strings.EqualFold(strings.TrimSpace(finding.Status), "needs-work") {
+			return true
+		}
+	}
+	return false
 }
 
 // criticPhaseTimeout is the maximum wall-clock time a single phase attempt
@@ -817,10 +934,12 @@ func BuildFixCriticPrompt(specDir string, fixes []Feature) string {
 		"Run ONLY Phase C (features.json decomposition) on the fix features above.",
 		"Check:",
 		"- Each fix feature has a clear, testable scope",
+		"- Each fix feature has description with context and implementation boundaries",
 		"- validation_refs reference real assertions",
 		"- depends_on references are valid",
 		"- No circular dependencies",
 		"- Scope is minimum (fix, not refactor)",
+		"- Root-cause fields are coherent: root_cause_hypothesis, evidence, done_when, non_goals, regression_guards",
 		"",
 		"Output ONLY a valid JSON object:",
 		`{"phase":"C","artifact":"fix-features","started_at":"<ISO>","ended_at":"<ISO>","mechanical":{"passed":0,"failed":0},"judgment":[{"criterion":"J-C1","status":"pass|needs-work","note":"..."}],"overall":"pass|needs-work","blocking_findings":[]}`,
@@ -996,8 +1115,15 @@ func compactFeaturesForCritic(path string) string {
 		Status         string   `json:"status"`
 		DependsOn      []string `json:"depends_on"`
 		Scope          string   `json:"scope"`
+		Description    string   `json:"description,omitempty"`
 		ValidationRefs []string `json:"validation_refs"`
 		Fixes          string   `json:"fixes,omitempty"`
+		Addresses      []string `json:"addresses,omitempty"`
+		RootCause      string   `json:"root_cause_hypothesis,omitempty"`
+		Evidence       []string `json:"evidence,omitempty"`
+		DoneWhen       []string `json:"done_when,omitempty"`
+		NonGoals       []string `json:"non_goals,omitempty"`
+		Regression     []string `json:"regression_guards,omitempty"`
 	}
 	all := append(manifest.Features, manifest.FixFeatures...)
 	compact := make([]compactFeature, len(all))
@@ -1009,8 +1135,15 @@ func compactFeaturesForCritic(path string) string {
 			Status:         f.Status,
 			DependsOn:      f.DependsOn,
 			Scope:          f.Scope,
+			Description:    f.Description,
 			ValidationRefs: f.ValidationRefs,
 			Fixes:          f.Fixes,
+			Addresses:      f.Addresses,
+			RootCause:      f.RootCauseHypothesis,
+			Evidence:       f.Evidence,
+			DoneWhen:       f.DoneWhen,
+			NonGoals:       f.NonGoals,
+			Regression:     f.RegressionGuards,
 		}
 	}
 	out, err := json.MarshalIndent(compact, "", "  ")

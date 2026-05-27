@@ -207,11 +207,7 @@ func normalizeCriticReportForPhase(report *CriticReport, phaseID string) *Critic
 	if report == nil {
 		return nil
 	}
-	cloned := *report
-	if strings.TrimSpace(cloned.Phase) == "" {
-		cloned.Phase = phaseID
-	}
-	return &cloned
+	return sanitizeCriticReportForPhase(report, phaseID)
 }
 
 func computeCriticPhaseInputHash(specDir string, phase criticPhase) string {
@@ -251,9 +247,13 @@ func loadCriticPhaseArtifacts(specDir string, phase criticPhase) []criticLoadedA
 		if !fileExists(abs) {
 			return criticLoadedArtifact{}, false
 		}
+		content := readFileContent(abs)
+		if phase.ID == criticPhaseDecomp.ID && name == "features.json" {
+			content = filterCriticDecompositionFeatures(content)
+		}
 		return criticLoadedArtifact{
 			Path:    abs,
-			Content: readFileContent(abs),
+			Content: content,
 		}, true
 	}
 
@@ -277,6 +277,47 @@ func loadCriticPhaseArtifacts(specDir string, phase criticPhase) []criticLoadedA
 		})
 	}
 	return artifacts
+}
+
+func filterCriticDecompositionFeatures(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return raw
+	}
+
+	var manifest FeaturesManifest
+	if err := json.Unmarshal([]byte(raw), &manifest); err != nil {
+		return raw
+	}
+
+	keepActive := func(features []Feature) []Feature {
+		filtered := make([]Feature, 0, len(features))
+		for _, feature := range features {
+			if isCriticIgnoredFeatureStatus(feature.Status) {
+				continue
+			}
+			filtered = append(filtered, feature)
+		}
+		return filtered
+	}
+
+	manifest.Features = keepActive(manifest.Features)
+	manifest.FixFeatures = keepActive(manifest.FixFeatures)
+
+	out, err := json.MarshalIndent(manifest, "", "  ")
+	if err != nil {
+		return raw
+	}
+	return string(out)
+}
+
+func isCriticIgnoredFeatureStatus(status string) bool {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "done", "validated":
+		return true
+	default:
+		return false
+	}
 }
 
 func captureCriticArtifactSnapshot(missionDir string) (criticArtifactSnapshot, error) {

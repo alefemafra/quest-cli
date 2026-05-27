@@ -242,7 +242,7 @@ from Round 1. Small = 1-2 features, Medium = 3-5, Large = 6+.
 **Feature ID format:** `F01`, `F02`, etc. Sub-features: `F01a`, `F01b`.
 
 **Present the decomposition to the user before writing.** Show each feature
-with its scope, validation_refs, and depends_on. Ask via `AskUserQuestion`:
+with its scope, description, validation_refs, and depends_on. Ask via `AskUserQuestion`:
 
 - "Decomposition looks correct — write features.json"
 - "I have changes" → apply changes, re-present
@@ -262,6 +262,7 @@ Once confirmed, write to `docs/specs/<slug>/mission/features.json`:
       "status": "pending",
       "depends_on": [],
       "scope": "<what needs to be done>",
+      "description": "<intent, boundaries, and critical implementation notes>",
       "validation_refs": ["api.1", "ui.1"]
     }
   ],

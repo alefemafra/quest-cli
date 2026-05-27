@@ -66,10 +66,11 @@ func BuildRefinementPrompt(feature Feature, report ValidatorReport, missionDir, 
 		"",
 		"1. Analyze each FAIL assertion — find the root cause, not surface cause",
 		"2. Generate minimum-scope fix features",
-		"3. Each fix feature must have: id, title, status (pending), depends_on, scope, validation_refs, fixes, addresses",
+		"3. Each fix feature must have: id, title, status (pending), depends_on, scope, description, validation_refs, fixes, addresses",
+		"4. Each fix feature must include root_cause_hypothesis, evidence, done_when, non_goals, regression_guards",
 		"",
 		"Output ONLY a valid JSON array of fix features:",
-		fmt.Sprintf(`[{"id":"%s-fix-1","title":"...","status":"pending","phase":%d,"depends_on":["%s"],"scope":"...","validation_refs":["..."],"fixes":"%s","addresses":["..."]}]`, feature.ID, feature.Phase, feature.ID, feature.ID),
+		fmt.Sprintf(`[{"id":"%s-fix-1","title":"...","status":"pending","phase":%d,"depends_on":["%s"],"scope":"...","description":"...","validation_refs":["..."],"fixes":"%s","addresses":["..."],"root_cause_hypothesis":"...","evidence":["..."],"done_when":["..."],"non_goals":["..."],"regression_guards":["..."]}]`, feature.ID, feature.Phase, feature.ID, feature.ID),
 		"",
 		"Output ONLY the JSON array, nothing else.",
 	)
@@ -239,6 +240,9 @@ func mergeFixFeatureEntries(base Feature, incoming Feature) Feature {
 	if incoming.Scope != "" {
 		merged.Scope = incoming.Scope
 	}
+	if incoming.Description != "" {
+		merged.Description = incoming.Description
+	}
 	if len(incoming.ValidationRefs) > 0 {
 		merged.ValidationRefs = incoming.ValidationRefs
 	}
@@ -247,6 +251,21 @@ func mergeFixFeatureEntries(base Feature, incoming Feature) Feature {
 	}
 	if len(incoming.Addresses) > 0 {
 		merged.Addresses = incoming.Addresses
+	}
+	if incoming.RootCauseHypothesis != "" {
+		merged.RootCauseHypothesis = incoming.RootCauseHypothesis
+	}
+	if len(incoming.Evidence) > 0 {
+		merged.Evidence = incoming.Evidence
+	}
+	if len(incoming.DoneWhen) > 0 {
+		merged.DoneWhen = incoming.DoneWhen
+	}
+	if len(incoming.NonGoals) > 0 {
+		merged.NonGoals = incoming.NonGoals
+	}
+	if len(incoming.RegressionGuards) > 0 {
+		merged.RegressionGuards = incoming.RegressionGuards
 	}
 	if incoming.Resolution != "" {
 		merged.Resolution = incoming.Resolution
