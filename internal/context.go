@@ -22,6 +22,7 @@ func GatherProjectContext(projectDir string) string {
 	routes := detectHTTPRoutes(projectDir)
 	tests := detectTestFiles(projectDir)
 	cliCmds := detectCLICommands(projectDir)
+	qualityCmds := DetectQualityCommands(projectDir)
 	claudeMd := readFileContent(filepath.Join(projectDir, "CLAUDE.md"))
 
 	var sb strings.Builder
@@ -70,6 +71,11 @@ func GatherProjectContext(projectDir string) string {
 	if cliCmds != "" {
 		sb.WriteString("## CLI Commands\n")
 		sb.WriteString(cliCmds + "\n\n")
+	}
+
+	if rendered := formatQualityCommands(qualityCmds); rendered != "" {
+		sb.WriteString("## Quality Gate Commands (lint/test)\n")
+		sb.WriteString(rendered + "\n\n")
 	}
 
 	if claudeMd != "" {
@@ -482,6 +488,272 @@ func containsStr(slice []string, s string) bool {
 	return false
 }
 
+func DetectQualityCommands(projectDir string) QualityCommandPlan {
+	plan := QualityCommandPlan{}
+	seen := map[string]bool{}
+
+	add := func(kind string, candidate QualityCommandCandidate) {
+		candidate.Command = strings.TrimSpace(candidate.Command)
+		candidate.Scope = strings.TrimSpace(candidate.Scope)
+		candidate.Source = strings.TrimSpace(candidate.Source)
+		if candidate.Command == "" {
+			return
+		}
+		if candidate.Scope == "" {
+			candidate.Scope = "targeted"
+		}
+		key := kind + "|" + candidate.Command
+		if seen[key] {
+			return
+		}
+		seen[key] = true
+		if kind == "lint" {
+			plan.LintCommands = append(plan.LintCommands, candidate)
+			return
+		}
+		plan.TestCommands = append(plan.TestCommands, candidate)
+	}
+
+	lintNode, testNode := detectNodeQualityCommands(projectDir)
+	for _, cmd := range lintNode {
+		add("lint", cmd)
+	}
+	for _, cmd := range testNode {
+		add("test", cmd)
+	}
+
+	if fileExists(filepath.Join(projectDir, "go.mod")) {
+		add("lint", QualityCommandCandidate{Command: "go vet ./...", Scope: "targeted", Source: "go.mod default"})
+		add("test", QualityCommandCandidate{Command: "go test ./...", Scope: "targeted", Source: "go.mod default"})
+	}
+
+	pyproject := readFileContent(filepath.Join(projectDir, "pyproject.toml"))
+	requirements := strings.ToLower(readFileContent(filepath.Join(projectDir, "requirements.txt")))
+	if pyproject != "" || requirements != "" || fileExists(filepath.Join(projectDir, "setup.py")) {
+		add("test", QualityCommandCandidate{Command: "pytest", Scope: "targeted", Source: "python default"})
+		pyprojectLower := strings.ToLower(pyproject)
+		if strings.Contains(pyprojectLower, "[tool.ruff") || strings.Contains(requirements, "ruff") || fileExists(filepath.Join(projectDir, ".ruff.toml")) {
+			add("lint", QualityCommandCandidate{Command: "ruff check .", Scope: "targeted", Source: "python lint"})
+		}
+		if strings.Contains(pyprojectLower, "[tool.mypy") || strings.Contains(requirements, "mypy") {
+			add("lint", QualityCommandCandidate{Command: "mypy .", Scope: "targeted", Source: "python lint"})
+		}
+		if strings.Contains(pyprojectLower, "[tool.flake8") || strings.Contains(requirements, "flake8") {
+			add("lint", QualityCommandCandidate{Command: "flake8 .", Scope: "targeted", Source: "python lint"})
+		}
+	}
+
+	if fileExists(filepath.Join(projectDir, "Cargo.toml")) {
+		add("lint", QualityCommandCandidate{Command: "cargo clippy --all-targets --all-features -- -D warnings", Scope: "targeted", Source: "cargo default"})
+		add("test", QualityCommandCandidate{Command: "cargo test --all-targets --all-features", Scope: "targeted", Source: "cargo default"})
+	}
+
+	makeTargets := detectMakeTargets(projectDir)
+	if len(plan.LintCommands) == 0 {
+		if makeTargets["lint"] {
+			add("lint", QualityCommandCandidate{Command: "make lint", Scope: "root", Source: "Makefile fallback"})
+		} else if makeTargets["check"] {
+			add("lint", QualityCommandCandidate{Command: "make check", Scope: "root", Source: "Makefile fallback"})
+		}
+	}
+	if len(plan.TestCommands) == 0 {
+		if makeTargets["test"] {
+			add("test", QualityCommandCandidate{Command: "make test", Scope: "root", Source: "Makefile fallback"})
+		} else if makeTargets["unit"] {
+			add("test", QualityCommandCandidate{Command: "make unit", Scope: "root", Source: "Makefile fallback"})
+		} else if makeTargets["check"] {
+			add("test", QualityCommandCandidate{Command: "make check", Scope: "root", Source: "Makefile fallback"})
+		}
+	}
+
+	claudeLint, claudeTest := detectClaudeQualityCommands(projectDir)
+	if len(plan.LintCommands) == 0 {
+		for _, cmd := range claudeLint {
+			add("lint", cmd)
+		}
+	}
+	if len(plan.TestCommands) == 0 {
+		for _, cmd := range claudeTest {
+			add("test", cmd)
+		}
+	}
+
+	return plan
+}
+
+func detectNodeQualityCommands(projectDir string) ([]QualityCommandCandidate, []QualityCommandCandidate) {
+	var pkg struct {
+		Scripts        map[string]string `json:"scripts"`
+		PackageManager string            `json:"packageManager"`
+	}
+	data := readFileContent(filepath.Join(projectDir, "package.json"))
+	if data == "" || json.Unmarshal([]byte(data), &pkg) != nil || len(pkg.Scripts) == 0 {
+		return nil, nil
+	}
+
+	pm := detectNodePackageManager(pkg.PackageManager)
+	lintKeys := []string{"lint", "lint:ci", "lint:check", "check:lint", "eslint"}
+	testKeys := []string{"test:unit", "test", "test:ci", "unit", "unit:test"}
+
+	selectScripts := func(keys []string, kind string) []QualityCommandCandidate {
+		var out []QualityCommandCandidate
+		for _, key := range keys {
+			script := strings.TrimSpace(pkg.Scripts[key])
+			if script == "" {
+				continue
+			}
+			if kind == "test" && key == "test" && strings.Contains(strings.ToLower(script), "no test specified") {
+				continue
+			}
+			out = append(out, QualityCommandCandidate{
+				Command: nodeScriptCommand(pm, key),
+				Scope:   "targeted",
+				Source:  "package.json scripts",
+			})
+		}
+		return out
+	}
+
+	return selectScripts(lintKeys, "lint"), selectScripts(testKeys, "test")
+}
+
+func detectNodePackageManager(raw string) string {
+	raw = strings.TrimSpace(raw)
+	switch {
+	case strings.HasPrefix(raw, "pnpm@"):
+		return "pnpm"
+	case strings.HasPrefix(raw, "yarn@"):
+		return "yarn"
+	case strings.HasPrefix(raw, "bun@"):
+		return "bun"
+	default:
+		return "npm"
+	}
+}
+
+func nodeScriptCommand(pm, script string) string {
+	switch pm {
+	case "yarn":
+		return "yarn " + script
+	case "pnpm":
+		return "pnpm run " + script
+	case "bun":
+		return "bun run " + script
+	default:
+		if script == "test" {
+			return "npm test"
+		}
+		return "npm run " + script
+	}
+}
+
+func detectMakeTargets(projectDir string) map[string]bool {
+	targets := map[string]bool{}
+	makefiles := []string{"Makefile", "makefile", "GNUmakefile"}
+	targetRe := regexp.MustCompile(`(?m)^([A-Za-z0-9_.-]+)\s*:`)
+
+	for _, name := range makefiles {
+		content := readFileContent(filepath.Join(projectDir, name))
+		if content == "" {
+			continue
+		}
+		matches := targetRe.FindAllStringSubmatch(content, -1)
+		for _, match := range matches {
+			if len(match) < 2 {
+				continue
+			}
+			target := strings.TrimSpace(strings.ToLower(match[1]))
+			if target == "" || strings.HasPrefix(target, ".") {
+				continue
+			}
+			targets[target] = true
+		}
+	}
+	return targets
+}
+
+func detectClaudeQualityCommands(projectDir string) ([]QualityCommandCandidate, []QualityCommandCandidate) {
+	content := readFileContent(filepath.Join(projectDir, "CLAUDE.md"))
+	if content == "" {
+		return nil, nil
+	}
+
+	var lint []QualityCommandCandidate
+	var test []QualityCommandCandidate
+	add := func(dst *[]QualityCommandCandidate, cmd, source string) {
+		cmd = strings.TrimSpace(cmd)
+		if cmd == "" {
+			return
+		}
+		for _, existing := range *dst {
+			if existing.Command == cmd {
+				return
+			}
+		}
+		*dst = append(*dst, QualityCommandCandidate{
+			Command: cmd,
+			Scope:   "root",
+			Source:  source,
+		})
+	}
+
+	lines := strings.Split(content, "\n")
+	for _, line := range lines {
+		cmd := sanitizeMarkdownCommandLine(line)
+		if cmd == "" {
+			continue
+		}
+		lower := strings.ToLower(cmd)
+		switch {
+		case strings.Contains(lower, " test") || strings.HasPrefix(lower, "test ") || strings.Contains(lower, "pytest") || strings.Contains(lower, "go test"):
+			add(&test, cmd, "CLAUDE.md command")
+		case strings.Contains(lower, "lint") || strings.Contains(lower, "vet") || strings.Contains(lower, "clippy") || strings.Contains(lower, "ruff") || strings.Contains(lower, "mypy") || strings.Contains(lower, "flake8"):
+			add(&lint, cmd, "CLAUDE.md command")
+		}
+	}
+
+	return lint, test
+}
+
+func sanitizeMarkdownCommandLine(line string) string {
+	line = strings.TrimSpace(line)
+	if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "```") {
+		return ""
+	}
+	line = strings.TrimPrefix(line, "- ")
+	line = strings.TrimPrefix(line, "* ")
+	if i := strings.Index(line, " #"); i >= 0 {
+		line = strings.TrimSpace(line[:i])
+	}
+	line = strings.Trim(line, "` ")
+	if line == "" {
+		return ""
+	}
+	if strings.Contains(line, " ") && (strings.HasPrefix(line, "go ") || strings.HasPrefix(line, "npm ") || strings.HasPrefix(line, "pnpm ") || strings.HasPrefix(line, "yarn ") || strings.HasPrefix(line, "cargo ") || strings.HasPrefix(line, "pytest") || strings.HasPrefix(line, "ruff ") || strings.HasPrefix(line, "mypy ") || strings.HasPrefix(line, "flake8 ") || strings.HasPrefix(line, "make ")) {
+		return line
+	}
+	return ""
+}
+
+func formatQualityCommands(plan QualityCommandPlan) string {
+	if len(plan.LintCommands) == 0 && len(plan.TestCommands) == 0 {
+		return ""
+	}
+
+	var lines []string
+	if len(plan.LintCommands) > 0 {
+		for _, cmd := range plan.LintCommands {
+			lines = append(lines, fmt.Sprintf("- lint: `%s` (%s; %s)", cmd.Command, cmd.Scope, cmd.Source))
+		}
+	}
+	if len(plan.TestCommands) > 0 {
+		for _, cmd := range plan.TestCommands {
+			lines = append(lines, fmt.Sprintf("- test: `%s` (%s; %s)", cmd.Command, cmd.Scope, cmd.Source))
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
 // GatherSpecCodeContext pre-reads source files relevant to a spec's domain
 // so they can be embedded in the prompt, eliminating the need for Claude to explore.
 func GatherSpecCodeContext(specDir, projectDir string) string {
@@ -614,7 +886,6 @@ func extractDomainKeywords(slug, parent string) []string {
 
 	return keywords
 }
-
 
 func detectHTTPRoutes(projectDir string) string {
 	type routePattern struct {

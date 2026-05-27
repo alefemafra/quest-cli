@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"path/filepath"
+	"regexp"
 	"strings"
 )
 
@@ -69,18 +70,20 @@ func BuildValidatorPrompt(feature Feature, missionDir, specDir string) string {
 	parts = append(parts,
 		"## Instructions",
 		"",
+		"0. Run lint and unit tests for this project using Project Context / CLAUDE.md commands. Both must pass to allow final PASS.",
 		"1. Read the assertions above",
-		"2. Exercise the system as a real user (CLI, HTTP, DB queries, etc.)",
+		"2. Exercise the system as a real user (CLI, HTTP, DB queries, browser/UI flows via DevTools MCP + Claude Chrome when applicable)",
 		"3. For each assertion: collect concrete evidence and decide PASS/FAIL/BLOCKED",
-		"4. If you discover anything useful (gotchas, edge cases, environment quirks, ambiguities),",
+		"4. If lint or unit tests fail, include evidence and set verdict to FAIL.",
+		"5. If you discover anything useful (gotchas, edge cases, environment quirks, ambiguities),",
 		"   APPEND an entry to "+filepath.Join(missionDir, "knowledge-base.md")+" formatted as",
 		"   `## YYYY-MM-DD — title`. Do NOT edit existing entries.",
-		"5. Write the structured report to "+filepath.Join(missionDir, "runs", feature.ID)+"/",
+		"6. Write the structured report to "+filepath.Join(missionDir, "runs", feature.ID)+"/",
 		"",
 		"After exercising the system, output ONLY a valid JSON object:",
 		fmt.Sprintf(`{"feature_id":"%s","role":"validator","started_at":"<ISO>","ended_at":"<ISO>","verdict":"PASS|FAIL|BLOCKED","assertions":[{"id":"<ref>","result":"PASS|FAIL|BLOCKED","evidence":"<proof>"}],"notes":[]}`, feature.ID),
 		"",
-		"Set verdict to PASS only if ALL assertions pass. Set FAIL if ANY fails. Set BLOCKED if impossible to test.",
+		"Set verdict to PASS only if lint + unit tests pass AND ALL assertions pass. Set FAIL if ANY fails. Set BLOCKED if impossible to test.",
 		"Output ONLY the JSON, nothing else.",
 	)
 
@@ -148,8 +151,26 @@ func ParseValidatorReport(text string) *ValidatorReport {
 
 	var report ValidatorReport
 	if err := json.Unmarshal([]byte(text), &report); err == nil && report.Verdict != "" {
+		// #region agent log
+		emitDebugLog(debugRunIDValidatorVerdictV1, "H1", "internal/validator.go:ParseValidatorReport:directJSON", "validator_parse_direct_json_success", map[string]any{
+			"verdict":    report.Verdict,
+			"textLen":    len(text),
+			"assertions": len(report.Assertions),
+			"notes":      len(report.Notes),
+		})
+		// #endregion
 		return &report
 	}
+
+	// #region agent log
+	emitDebugLog(debugRunIDValidatorVerdictV1, "H1", "internal/validator.go:ParseValidatorReport:directJSON", "validator_parse_direct_json_failed", map[string]any{
+		"textLen":            len(text),
+		"hasCodeFence":       strings.Contains(text, "```"),
+		"containsVerdictKey": strings.Contains(strings.ToUpper(text), "\"VERDICT\""),
+		"containsPASS":       strings.Contains(strings.ToUpper(text), "PASS"),
+		"containsFAIL":       strings.Contains(strings.ToUpper(text), "FAIL"),
+	})
+	// #endregion
 
 	// Try code fence extraction
 	re := strings.Index(text, "```")
@@ -161,8 +182,56 @@ func ParseValidatorReport(text string) *ValidatorReport {
 				block = block[nl+1:]
 			}
 			if err := json.Unmarshal([]byte(strings.TrimSpace(block)), &report); err == nil && report.Verdict != "" {
+				// #region agent log
+				emitDebugLog(debugRunIDValidatorVerdictV1, "H1", "internal/validator.go:ParseValidatorReport:codeFence", "validator_parse_code_fence_success", map[string]any{
+					"verdict": report.Verdict,
+				})
+				// #endregion
 				return &report
 			}
+		}
+	}
+
+	// Try extracting a JSON object from mixed prose + JSON output.
+	// Claude sometimes prepends narration before the final object.
+	if idx := strings.Index(text, "{"); idx >= 0 {
+		candidate := strings.TrimSpace(text[idx:])
+		dec := json.NewDecoder(strings.NewReader(candidate))
+		var embedded ValidatorReport
+		if err := dec.Decode(&embedded); err == nil && embedded.Verdict != "" {
+			// #region agent log
+			emitDebugLog(debugRunIDValidatorVerdictV1, "H2", "internal/validator.go:ParseValidatorReport:embeddedJSON", "validator_parse_embedded_json_success", map[string]any{
+				"verdict": embedded.Verdict,
+				"textLen": len(text),
+			})
+			// #endregion
+			return &embedded
+		}
+		// #region agent log
+		emitDebugLog(debugRunIDValidatorVerdictV1, "H2", "internal/validator.go:ParseValidatorReport:embeddedJSON", "validator_parse_embedded_json_failed", map[string]any{
+			"textLen": len(text),
+		})
+		// #endregion
+	}
+
+	// Parse explicit verdict token before coarse keyword fallback.
+	verdictRe := regexp.MustCompile(`(?i)"verdict"\s*:\s*"(PASS|FAIL|BLOCKED)"|(?i)\bverdict\s*:\s*(PASS|FAIL|BLOCKED)\b`)
+	if m := verdictRe.FindStringSubmatch(text); len(m) > 0 {
+		verdict := ""
+		for i := 1; i < len(m); i++ {
+			if strings.TrimSpace(m[i]) != "" {
+				verdict = strings.ToUpper(strings.TrimSpace(m[i]))
+				break
+			}
+		}
+		if verdict != "" {
+			// #region agent log
+			emitDebugLog(debugRunIDValidatorVerdictV1, "H1", "internal/validator.go:ParseValidatorReport:regexVerdict", "validator_parse_regex_verdict", map[string]any{
+				"verdict": verdict,
+				"textLen": len(text),
+			})
+			// #endregion
+			return &ValidatorReport{Verdict: verdict}
 		}
 	}
 
@@ -170,12 +239,33 @@ func ParseValidatorReport(text string) *ValidatorReport {
 	upper := strings.ToUpper(text)
 	if strings.Contains(upper, "\"VERDICT\"") || strings.Contains(upper, "VERDICT:") {
 		if strings.Contains(upper, "FAIL") {
+			// #region agent log
+			emitDebugLog(debugRunIDValidatorVerdictV1, "H1", "internal/validator.go:ParseValidatorReport:fallback", "validator_parse_fallback_keyword_fail", map[string]any{
+				"containsPASS":    strings.Contains(upper, "PASS"),
+				"containsFAIL":    true,
+				"containsBLOCKED": strings.Contains(upper, "BLOCKED"),
+			})
+			// #endregion
 			return &ValidatorReport{Verdict: "FAIL"}
 		}
 		if strings.Contains(upper, "PASS") {
+			// #region agent log
+			emitDebugLog(debugRunIDValidatorVerdictV1, "H1", "internal/validator.go:ParseValidatorReport:fallback", "validator_parse_fallback_keyword_pass", map[string]any{
+				"containsPASS":    true,
+				"containsFAIL":    strings.Contains(upper, "FAIL"),
+				"containsBLOCKED": strings.Contains(upper, "BLOCKED"),
+			})
+			// #endregion
 			return &ValidatorReport{Verdict: "PASS"}
 		}
 		if strings.Contains(upper, "BLOCKED") {
+			// #region agent log
+			emitDebugLog(debugRunIDValidatorVerdictV1, "H1", "internal/validator.go:ParseValidatorReport:fallback", "validator_parse_fallback_keyword_blocked", map[string]any{
+				"containsPASS":    strings.Contains(upper, "PASS"),
+				"containsFAIL":    strings.Contains(upper, "FAIL"),
+				"containsBLOCKED": true,
+			})
+			// #endregion
 			return &ValidatorReport{Verdict: "BLOCKED"}
 		}
 	}

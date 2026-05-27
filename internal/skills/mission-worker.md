@@ -1,6 +1,6 @@
 ---
 name: mission-worker
-description: Use to implement a feature inside a project that follows Missions Architecture. Implements with TDD, reads the validation contract and knowledge-base from the feature folder (docs/specs/<slug>/mission/), updates features.json, leaves the system ready for black-box validation.
+description: Use to implement a feature inside a project that follows Missions Architecture. Implements with TDD, reads the validation contract and knowledge-base from the feature folder (docs/specs/<slug>/mission/), and leaves the system ready for black-box validation.
 ---
 
 # Mission Worker
@@ -16,7 +16,7 @@ The orchestrator passes you a feature folder path (`docs/specs/<slug>/`). Read i
 3. Read `docs/specs/<slug>/mission/validation-contract.md` — focus on the assertions listed in your feature's `validation_refs`.
 4. Read `docs/specs/<slug>/mission/knowledge-base.md` — prior findings that may save you time or stop you from repeating a mistake.
 5. Read `docs/specs/<slug>/mission/features.json` — understand dependencies and the feature's context.
-6. Update the feature's status to `in_progress`.
+6. Do NOT manage feature status manually. The orchestrator updates `features.json`.
 
 ## Implementation must be TDD
 
@@ -30,7 +30,7 @@ If an assertion is hard to test automatically (e.g., bot tone, visual UX), docum
 ## Scope discipline
 
 - Do ONLY what is described in the feature's `scope` field. Do not refactor adjacent areas. Do not slip in "while we're here" features. Resist.
-- If you discover the scope is wrong or incomplete: stop. Document in `docs/specs/<slug>/mission/knowledge-base.md`, mark the feature as `blocked` in `docs/specs/<slug>/mission/features.json`, report to the orchestrator. Do not improvise.
+- If you discover the scope is wrong or incomplete: stop. Document in `docs/specs/<slug>/mission/knowledge-base.md` and report to the orchestrator. Do not improvise.
 
 ## Implementation completeness — MANDATORY checks before ending
 
@@ -40,23 +40,24 @@ A feature is NOT done until ALL of the following are true:
    in the scope EXISTS on disk and is fully implemented — not a stub, not a TODO.
 2. Every test file imports from source files that EXIST. Run a quick check:
    for each test import, verify the source module is on disk.
-3. All tests PASS (run them — do not assume).
-4. The feature is functionally complete as described in the scope field.
+3. Lint PASS for the stack/package touched by this feature.
+4. Unit tests PASS (run them — do not assume).
+5. The feature is functionally complete as described in the scope field.
 
 If ANY source file is missing: keep working. Do not end the session.
-If you ran out of ideas or hit a blocker: mark `blocked` in features.json, NOT
-`awaiting_validation`. Document what is missing in knowledge-base.md.
+If you ran out of ideas or hit a blocker: document what is missing in knowledge-base.md and end the session.
 
-**NEVER mark awaiting_validation if tests import non-existent modules.**
+**NEVER stop if tests import non-existent modules.**
 **NEVER end a session with implementation code missing.**
 
 ## Before ending the session
 
 1. Verify implementation completeness (see checks above).
-2. Run all tests. Green.
-3. If you learned something that affects future features (schema decision, library gotcha, pattern to follow), APPEND an entry to `docs/specs/<slug>/mission/knowledge-base.md` formatted as `## YYYY-MM-DD — title`.
-4. Update the feature's status to `awaiting_validation` in `docs/specs/<slug>/mission/features.json`.
-4. **Write structured output** at `docs/specs/<slug>/mission/runs/<feature_id>/<ISO-timestamp>-worker.json`:
+2. Run lint. Green.
+3. Run unit tests. Green.
+4. If you learned something that affects future features (schema decision, library gotcha, pattern to follow), APPEND an entry to `docs/specs/<slug>/mission/knowledge-base.md` formatted as `## YYYY-MM-DD — title`.
+5. Do NOT set `awaiting_validation` manually. The orchestrator enforces lint/tests and updates status.
+6. **Write structured output** at `docs/specs/<slug>/mission/runs/<feature_id>/<ISO-timestamp>-worker.json`:
    ```json
    {
      "feature_id": "F01",
@@ -73,7 +74,7 @@ If you ran out of ideas or hit a blocker: mark `blocked` in features.json, NOT
    }
    ```
    Create the directory `docs/specs/<slug>/mission/runs/<feature_id>/` if it does not exist.
-5. Report to the orchestrator: feature ID, link to the output JSON, points that need the validator's attention.
+7. Report to the orchestrator: feature ID, link to the output JSON, points that need the validator's attention.
 
 ## Antipatterns
 

@@ -126,7 +126,7 @@ type WorkerEvent struct {
 	Err          error
 	AllDone      bool
 	Phase        int
-	Role         string // "", "critic", "validator", "refinement"
+	Role         string // "", "critic", "critic-fix", "validator", "refinement"
 	Verdict      string // "PASS", "FAIL", "BLOCKED" (validator only)
 	CriticReport *CriticReport
 }
@@ -151,6 +151,38 @@ type ValidatorReport struct {
 	Verdict    string               `json:"verdict"`
 	Assertions []ValidatorAssertion `json:"assertions"`
 	Notes      []string             `json:"notes"`
+}
+
+type QualityCommandCandidate struct {
+	Command string `json:"command"`
+	Scope   string `json:"scope"` // "targeted" | "root"
+	Source  string `json:"source"`
+}
+
+type QualityCommandPlan struct {
+	LintCommands []QualityCommandCandidate `json:"lint_commands"`
+	TestCommands []QualityCommandCandidate `json:"test_commands"`
+}
+
+type QualityCommandRun struct {
+	Command    string `json:"command"`
+	Scope      string `json:"scope"`
+	Source     string `json:"source"`
+	Kind       string `json:"kind"` // "lint" | "test"
+	Passed     bool   `json:"passed"`
+	Output     string `json:"output,omitempty"`
+	DurationMs int64  `json:"duration_ms"`
+}
+
+type QualityGateResult struct {
+	StartedAt  string              `json:"started_at"`
+	EndedAt    string              `json:"ended_at"`
+	Passed     bool                `json:"passed"`
+	LintPassed bool                `json:"lint_passed"`
+	TestPassed bool                `json:"test_passed"`
+	LintRuns   []QualityCommandRun `json:"lint_runs"`
+	TestRuns   []QualityCommandRun `json:"test_runs"`
+	Notes      []string            `json:"notes,omitempty"`
 }
 
 type CriticFinding struct {

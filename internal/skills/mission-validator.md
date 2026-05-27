@@ -25,6 +25,7 @@ YOU CAN (and should) read:
 
 ## Process
 
+0. Run lint and unit tests first using commands from `project-context.md` and `CLAUDE.md`. If either fails, capture evidence and the feature cannot be PASS.
 1. Read the contract at `docs/specs/<slug>/mission/validation-contract.md` and identify the exact list of assertions to validate (provided by the orchestrator in the prompt + the feature's `validation_refs` in `docs/specs/<slug>/mission/features.json`).
 2. For each assertion:
    - **Exercise the system** as a real user. If the assertion is "command /sleep creates a manual_event", send the command, open the database, confirm the row. Reading the code is not enough.
@@ -87,6 +88,7 @@ Create the directory `docs/specs/<slug>/mission/runs/<feature_id>/` if it does n
 - **Validate behavior, not intent.** "I think they meant X" does not count; the system does X or it does not.
 - **Black-box whenever possible.** Validating via interface (CLI, HTTP, bot, UI) is more robust than reading code.
 - **Evidence is mandatory.** PASS without evidence is not PASS — it is a guess.
+- **PASS requires green quality gate.** Lint and unit tests must pass in addition to assertion validation.
 - **If an assertion depends on time** (e.g., cron), use the system's mechanisms (trigger manually, mock the clock) — describe exactly what you did.
 
 ## Antipatterns

@@ -353,9 +353,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case criticLoopMsg:
+		if !m.inCriticGenerationFlow() {
+			return m, nil
+		}
 		return m.handleCriticLoopMsg(msg)
 
 	case criticFixDoneMsg:
+		if !m.inCriticGenerationFlow() {
+			return m, nil
+		}
 		return m.handleCriticFixDone(msg)
 
 	case advisoryFixDoneMsg:
@@ -1619,6 +1625,7 @@ func (m Model) approvePlan() (tea.Model, tea.Cmd) {
 	m.logFilter = -1
 
 	pool := NewWorkerPool(m.projectDir, m.missionDir, pending, logger, &m.verbose)
+	pool.autonomousMode = true
 	m.workerPool = pool
 
 	m.updateDashboardContent()
@@ -1627,6 +1634,7 @@ func (m Model) approvePlan() (tea.Model, tea.Cmd) {
 
 func (m Model) startWorkers() (tea.Model, tea.Cmd) {
 	m.mission = ReadMissionState(m.missionDir)
+	m.resetCriticGenerationState()
 
 	// If the critic already passed during plan generation OR the user
 	// explicitly approved running without the critic gate, skip the gate
@@ -1652,6 +1660,7 @@ func (m Model) startWorkers() (tea.Model, tea.Cmd) {
 	m.logFilter = -1
 
 	pool := NewWorkerPool(m.projectDir, m.missionDir, pending, logger, &m.verbose)
+	pool.autonomousMode = true
 	m.workerPool = pool
 
 	m.updateDashboardContent()
@@ -1705,6 +1714,7 @@ func (m Model) startAutoFix() (tea.Model, tea.Cmd) {
 
 func (m Model) startWorkersSkipCritic() (tea.Model, tea.Cmd) {
 	m.mission = ReadMissionState(m.missionDir)
+	m.resetCriticGenerationState()
 	m.criticBypassed = true
 
 	var pending []Feature
@@ -1725,6 +1735,7 @@ func (m Model) startWorkersSkipCritic() (tea.Model, tea.Cmd) {
 
 	pool := NewWorkerPool(m.projectDir, m.missionDir, pending, logger, &m.verbose)
 	pool.skipCritic = true
+	pool.autonomousMode = true
 	m.workerPool = pool
 
 	m.updateDashboardContent()
@@ -1799,6 +1810,10 @@ func (m Model) startCriticLoop() (tea.Model, tea.Cmd) {
 }
 
 func (m Model) handleCriticLoopMsg(msg criticLoopMsg) (tea.Model, tea.Cmd) {
+	if !m.inCriticGenerationFlow() {
+		return m, nil
+	}
+
 	m.claudeRunning = false
 	m.criticStreamCh = nil
 	elapsed := time.Since(m.claudeStartTime).Round(time.Second)
@@ -1878,37 +1893,24 @@ func (m Model) startCriticFix(report *CriticReport) (tea.Model, tea.Cmd) {
 	doneCh := make(chan criticFixDoneMsg, 1)
 
 	go func() {
-		prompt := BuildBlockingAutoFixPrompt(report, specDir, projectDir)
-		if prompt == "" {
-			close(streamCh)
-			doneCh <- criticFixDoneMsg{err: fmt.Errorf("no blocking findings to fix")}
-			return
-		}
-		ch := make(chan ClaudeStreamMsg, 64)
 		v := true
-		_ = StartClaude(prompt, projectDir, &v, ch,
-			"--allowedTools", "Read,Edit,Write,Bash,Glob,Grep",
-			"--max-turns", "15",
-			"--model", "sonnet",
-		)
-		var lastErr error
-		for msg := range ch {
-			if msg.Done {
-				lastErr = msg.Err
-				break
+		err := RunCriticBlockingAutoFix(report, specDir, projectDir, &v, func(line string) {
+			if line != "" {
+				streamCh <- criticStreamMsg{line: line}
 			}
-			if msg.Line != "" {
-				streamCh <- criticStreamMsg{line: msg.Line}
-			}
-		}
+		})
 		close(streamCh)
-		doneCh <- criticFixDoneMsg{err: lastErr}
+		doneCh <- criticFixDoneMsg{err: err}
 	}()
 
 	return m, tea.Batch(listenCriticStream(streamCh), listenCriticFixDone(doneCh), m.spinner.Tick)
 }
 
 func (m Model) handleCriticFixDone(msg criticFixDoneMsg) (tea.Model, tea.Cmd) {
+	if !m.inCriticGenerationFlow() {
+		return m, nil
+	}
+
 	m.claudeRunning = false
 	m.criticStreamCh = nil
 	elapsed := time.Since(m.claudeStartTime).Round(time.Second)
@@ -1961,6 +1963,7 @@ func (m Model) transitionToReview() (tea.Model, tea.Cmd) {
 
 func (m Model) startWorkersAfterCritic() (tea.Model, tea.Cmd) {
 	m.mission = ReadMissionState(m.missionDir)
+	m.resetCriticGenerationState()
 
 	var pending []Feature
 	for _, f := range m.mission.Features {
@@ -1983,10 +1986,25 @@ func (m Model) startWorkersAfterCritic() (tea.Model, tea.Cmd) {
 
 	pool := NewWorkerPool(m.projectDir, m.missionDir, pending, logger, &m.verbose)
 	pool.skipCritic = true
+	pool.autonomousMode = true
 	m.workerPool = pool
 
 	m.updateDashboardContent()
 	return m, tea.Batch(pool.Start(), m.spinner.Tick)
+}
+
+func (m Model) inCriticGenerationFlow() bool {
+	if m.phase != PhaseRunning {
+		return false
+	}
+	return m.genPhase == GenPhaseCritic || m.genPhase == GenPhaseFixLoop
+}
+
+func (m *Model) resetCriticGenerationState() {
+	m.phase = PhaseDashboard
+	m.genPhase = GenPhaseNone
+	m.criticLoopCh = nil
+	m.criticStreamCh = nil
 }
 
 func (m Model) startAdvisoryFix(findings []CriticFinding) (tea.Model, tea.Cmd) {
@@ -2478,6 +2496,8 @@ func (m Model) handleWorkerEvent(ev WorkerEvent) (tea.Model, tea.Cmd) {
 		switch {
 		case ev.Role == "critic":
 			prefix = "[CRITIC]"
+		case ev.Role == "critic-fix":
+			prefix = "[AUTOFIX]"
 		case ev.Role == "validator" && ev.FeatureID != "":
 			prefix = fmt.Sprintf("[VALIDATOR:%s]", ev.FeatureID)
 		case ev.Role == "refinement" && ev.FeatureID != "":
@@ -3348,7 +3368,9 @@ func (m Model) renderExecutingOverview(totalW, leftW, rightW, leftInner, rightIn
 	logWrap := lipgloss.NewStyle().Width(rightInner)
 	for _, line := range m.workerLogs[start:] {
 		var renderStyle lipgloss.Style
-		if strings.Contains(line, "✓") {
+		if strings.HasPrefix(line, "[AUTOFIX]") {
+			renderStyle = m.styles.Magenta
+		} else if strings.Contains(line, "✓") {
 			renderStyle = m.styles.Green
 		} else if strings.Contains(line, "✕") {
 			renderStyle = m.styles.Red
