@@ -751,7 +751,7 @@ func BuildSkillPrompt(specDir, projectDir string) string {
 	slug := filepath.Base(specDir)
 	missionDir := ResolveArtifactDir(specDir)
 
-		tmpFile, err := os.CreateTemp("", "spec-to-quest-*.md")
+	tmpFile, err := os.CreateTemp("", "spec-to-quest-*.md")
 	skillPath := ""
 	if err == nil {
 		tmpFile.WriteString(ReadSkill("spec-to-quest"))
@@ -929,6 +929,7 @@ func BuildFeaturesPrompt(specDir, projectDir string, assertionIDs map[string][]s
 		"",
 		"- Every assertion ID above MUST be referenced by >=1 feature.validation_refs",
 		"- Every feature MUST have non-empty scope (>=80 chars) describing schemas, validation, file paths",
+		"- Every feature MUST include description (>=120 chars) with intent, boundaries, and key implementation notes",
 		"- Every feature MUST have >=1 validation_refs entry",
 		"- Order features by phase: 0 (foundation: schemas/types/fixtures) -> 1 (core: hooks/page/forms) -> 2 (integration) -> 3 (polish: a11y/perf/tests)",
 		"- depends_on must list the IDs of features producing code this one consumes",
@@ -1054,6 +1055,10 @@ func formatFeaturesForKnowledge(features []Feature) string {
 		if scope := strings.TrimSpace(f.Scope); scope != "" {
 			b.WriteString("\n    scope: ")
 			b.WriteString(truncatePreview(scope, 240))
+		}
+		if description := strings.TrimSpace(f.Description); description != "" {
+			b.WriteString("\n    description: ")
+			b.WriteString(truncatePreview(description, 280))
 		}
 		if len(f.ValidationRefs) > 0 {
 			b.WriteString("\n    refs: ")
@@ -1341,6 +1346,75 @@ func CompactKnowledge(knowledge string) string {
 	return strings.Join(entries, "\n")
 }
 
+func truncateBlock(s string, max int) string {
+	s = strings.TrimSpace(s)
+	if max <= 0 || len(s) <= max {
+		return s
+	}
+	return s[:max] + "\n...[truncated]..."
+}
+
+func compactFeatureStateForPrompt(missionDir string, maxEntries int) string {
+	state := ReadMissionState(missionDir)
+	if !state.Exists || len(state.Features) == 0 {
+		return ""
+	}
+	if maxEntries <= 0 {
+		maxEntries = len(state.Features)
+	}
+	var b strings.Builder
+	limit := len(state.Features)
+	if limit > maxEntries {
+		limit = maxEntries
+	}
+	for i := 0; i < limit; i++ {
+		f := state.Features[i]
+		line := fmt.Sprintf("- %s [%s p%d] %s", f.ID, f.Status, f.Phase, truncatePreview(f.Title, 80))
+		if len(f.ValidationRefs) > 0 {
+			line += fmt.Sprintf(" refs:%d", len(f.ValidationRefs))
+		}
+		b.WriteString(line)
+		b.WriteString("\n")
+	}
+	if len(state.Features) > limit {
+		b.WriteString(fmt.Sprintf("... %d more features omitted\n", len(state.Features)-limit))
+	}
+	return b.String()
+}
+
+func extractAssertionIDsFromText(text string) map[string]struct{} {
+	out := make(map[string]struct{})
+	re := regexp.MustCompile(`\b[a-z][a-z0-9_-]*\.\d+\b`)
+	for _, m := range re.FindAllString(strings.ToLower(text), -1) {
+		out[m] = struct{}{}
+	}
+	return out
+}
+
+func filterAssertionIDsForChanges(ids map[string][]string, changesScopeJSON string) map[string][]string {
+	want := extractAssertionIDsFromText(changesScopeJSON)
+	if len(want) == 0 {
+		return ids
+	}
+	filtered := make(map[string][]string)
+	for cat, list := range ids {
+		for _, id := range list {
+			if _, ok := want[strings.ToLower(id)]; ok {
+				filtered[cat] = append(filtered[cat], id)
+			}
+		}
+	}
+	// Fallback to full set if we couldn't resolve any IDs from changes output.
+	total := 0
+	for _, v := range filtered {
+		total += len(v)
+	}
+	if total == 0 {
+		return ids
+	}
+	return filtered
+}
+
 // Deprecated: kept for standalone testing. The pipeline uses BuildSkillPrompt instead.
 func BuildFeaturesOnlyPrompt(specDir string) string {
 	slug := filepath.Base(specDir)
@@ -1436,37 +1510,32 @@ func BuildKnowledgePrompt(specDir string) string {
 }
 
 func BuildRegenPlanPrompt(specDir, missionDir, projectDir string) string {
-	skill := ReadSkill("spec-to-quest")
-	projectContext := loadProjectContext(missionDir, projectDir)
-
+	_ = projectDir
 	specContent := readFileContent(filepath.Join(specDir, "spec.md"))
 	featuresJSON := readFileContent(filepath.Join(missionDir, "features.json"))
 	contractContent := readFileContent(filepath.Join(missionDir, "validation-contract.md"))
-	knowledgeContent := readFileContent(filepath.Join(missionDir, "knowledge-base.md"))
 
 	var completedSummary strings.Builder
 	state := ReadMissionState(missionDir)
 	for _, f := range state.Features {
 		completedSummary.WriteString(fmt.Sprintf("- %s: %q [status: %s] scope: %s\n", f.ID, f.Title, f.Status, f.Scope))
+		if strings.TrimSpace(f.Description) != "" {
+			completedSummary.WriteString(fmt.Sprintf("  description: %s\n", truncatePreview(f.Description, 220)))
+		}
 	}
 
 	return strings.Join([]string{
 		"You are regenerating a mission plan for a spec that has CHANGED since the original plan was created.",
-		"Some features may already be implemented. You must diff the spec against the current plan and produce an updated plan.",
+		"Keep this focused and fast: regenerate only features and validation assertions.",
+		"Do NOT rewrite knowledge-base content.",
 		"",
-		"## Project Context",
+		"ALL required artifacts are provided inline below. Do not use tools.",
 		"",
-		projectContext,
-		"",
-		"## Skill Instructions",
-		"",
-		skill,
-		"",
-		"## Current Spec",
+		"## Spec (source of truth)",
 		"",
 		specContent,
 		"",
-		"## Current Mission State",
+		"## Current Plan Artifacts",
 		"",
 		"### features.json",
 		featuresJSON,
@@ -1474,31 +1543,322 @@ func BuildRegenPlanPrompt(specDir, missionDir, projectDir string) string {
 		"### Feature Summary",
 		completedSummary.String(),
 		"",
-		"### Validation Contract",
+		"### Current validation-contract.md",
 		contractContent,
-		"",
-		"### Knowledge Base",
-		knowledgeContent,
 		"",
 		"## Regeneration Rules",
 		"",
-		"1. READ the spec carefully — it is the source of truth for what SHOULD exist",
-		"2. COMPARE against the current features.json — understand what WAS planned",
-		"3. Features with status \"done\" or \"validated\": KEEP as-is (same ID, title, scope, status). These are already implemented.",
-		"4. Features with status \"pending\" or \"blocked\": RE-EVALUATE against the current spec. Keep if still needed, remove if no longer relevant, update scope if the spec changed.",
-		"5. Features with status \"in_progress\", \"awaiting_validation\", \"validating\", or \"refining\": RESET to \"pending\" with updated scope if the spec changed.",
-		"6. Identify NEW requirements in the spec that have no matching feature — create new features for them.",
-		"7. Identify REMOVED requirements — drop features that are no longer in the spec (unless status is \"done\").",
-		"8. Re-derive validation assertions from the CURRENT spec. Keep assertion IDs stable for done features.",
-		"9. Maintain correct dependency ordering and phase assignments.",
-		"10. Update knowledge base entries if the spec changes invalidate any prior findings.",
-		"11. Preserve fix lineage: do not rename or reuse IDs from existing fix_features; avoid introducing IDs that collide with existing features/fixes.",
+		"1. Keep features with status \"done\" or \"validated\" as-is.",
+		"2. Re-evaluate non-terminal features against the current spec: keep/update/remove as needed.",
+		"3. Add features for new requirements and remove obsolete non-terminal features.",
+		"4. Regenerate assertions from CURRENT spec with stable IDs where possible.",
+		"5. Keep dependency ordering and phases coherent.",
+		"6. Preserve fix lineage: do not rename/reuse IDs from existing fix_features.",
 		"",
 		"## Output",
 		"",
-		"Output ONLY a valid JSON object (no markdown, no explanation, no code fences) matching this schema:",
-		`{"slug":"...","spec":"docs/specs/<slug>/spec.md","project":"...","owner":"...","features":[{"id":"F01","title":"...","status":"done|pending","phase":0,"depends_on":[],"scope":"...","validation_refs":["cat.1"]}],"assertions":[{"category":"cat","items":["cat.1: Assertion"]}],"knowledge":["..."]}`,
+		"Output ONLY valid JSON (no markdown/explanations) with this shape:",
+		`{"slug":"...","spec":"docs/specs/<slug>/spec.md","project":"...","owner":"...","features":[{"id":"F01","title":"...","status":"done|pending","phase":0,"depends_on":[],"scope":"...","description":"...","validation_refs":["cat.1"]}],"assertions":[{"category":"cat","items":["cat.1: Assertion"]}]}`,
 	}, "\n")
+}
+
+func BuildRegenAssertionsPrompt(specDir, missionDir, projectDir string, retryFeedback string) string {
+	_ = projectDir
+	specContent := readFileContent(filepath.Join(specDir, "spec.md"))
+	currentContract := readFileContent(filepath.Join(missionDir, "validation-contract.md"))
+
+	var parts []string
+	parts = append(parts,
+		"IMPORTANT: Do NOT narrate. Output ONLY JSON.",
+		"Regeneration mode: produce ONLY validation assertions for the updated spec.",
+		"All inputs are inlined below. Do not use tools.",
+		"",
+	)
+
+	if retryFeedback != "" {
+		parts = append(parts,
+			"## Previous attempt had coverage gaps. Fix these before re-emitting:",
+			"",
+			retryFeedback,
+			"",
+			"Re-emit the COMPLETE corrected JSON array (not a diff).",
+			"",
+		)
+	}
+
+	parts = append(parts,
+		"## Current Spec",
+		"",
+		specContent,
+		"",
+		"## Existing validation-contract.md (for ID stability reference)",
+		"",
+		currentContract,
+		"",
+		"## Rules",
+		"",
+		"- Regenerate assertions from the CURRENT spec.",
+		"- Keep assertion IDs stable where possible to minimize churn.",
+		"- Include only assertions that are relevant to current requirements.",
+		"",
+		"## Output",
+		"",
+		`Output ONLY a JSON array of {"category","items"} objects.`,
+	)
+
+	return strings.Join(parts, "\n")
+}
+
+func BuildRegenFeaturesPrompt(specDir, missionDir, projectDir string, assertionIDs map[string][]string, retryFeedback string) string {
+	_ = projectDir
+	specContent := readFileContent(filepath.Join(specDir, "spec.md"))
+	featuresJSON := readFileContent(filepath.Join(missionDir, "features.json"))
+
+	var completedSummary strings.Builder
+	state := ReadMissionState(missionDir)
+	for _, f := range state.Features {
+		completedSummary.WriteString(fmt.Sprintf("- %s: %q [status: %s] scope: %s\n", f.ID, f.Title, f.Status, f.Scope))
+		if strings.TrimSpace(f.Description) != "" {
+			completedSummary.WriteString(fmt.Sprintf("  description: %s\n", truncatePreview(f.Description, 220)))
+		}
+	}
+
+	var parts []string
+	parts = append(parts,
+		"IMPORTANT: Do NOT narrate. Output ONLY JSON.",
+		"Regeneration mode: produce ONLY the updated features list.",
+		"All inputs are inlined below. Do not use tools.",
+		"",
+	)
+
+	if retryFeedback != "" {
+		parts = append(parts,
+			"## Previous attempt had coverage gaps. Fix these before re-emitting:",
+			"",
+			retryFeedback,
+			"",
+			"Re-emit the COMPLETE corrected JSON object (not a diff).",
+			"",
+		)
+	}
+
+	parts = append(parts,
+		"## Current Spec",
+		"",
+		specContent,
+		"",
+		"## Existing features snapshot",
+		"",
+		featuresJSON,
+		"",
+		"## Existing Feature Status Summary",
+		"",
+		completedSummary.String(),
+		"",
+		"## Assertion IDs to cover",
+		"",
+		formatAssertionIDList(assertionIDs),
+		"",
+		"## Rules",
+		"",
+		"- Keep features marked done/validated semantically intact.",
+		"- Re-evaluate pending/non-terminal features against the current spec.",
+		"- Add new features for new requirements; remove obsolete non-terminal features.",
+		"- Every assertion ID above must be covered by >=1 feature.validation_refs.",
+		"- Every feature in upsert output must include non-empty description with clear implementation guidance.",
+		"- Keep phases and dependencies coherent.",
+		"- Preserve fix lineage and avoid ID collisions with existing fix_features.",
+		"",
+		"## Output",
+		"",
+		`Output ONLY a JSON object {"features":[...]} (no knowledge field).`,
+	)
+
+	return strings.Join(parts, "\n")
+}
+
+func BuildChangesDiffPrompt(specDir, missionDir, projectDir string, tight bool) string {
+	_ = projectDir
+	specContent := readFileContent(filepath.Join(specDir, "spec.md"))
+	knowledgeContent := readFileContent(filepath.Join(missionDir, "knowledge-base.md"))
+	specCoverage := extractSpecStructure(specContent)
+	if specCoverage == "" {
+		specCoverage = truncateBlock(specContent, 5000)
+	}
+	featureLimit := 120
+	contractLimit := 2200
+	knowledgeLimit := 1200
+	if tight {
+		specCoverage = truncateBlock(specCoverage, 2400)
+		featureLimit = 60
+		contractLimit = 1200
+		knowledgeLimit = 600
+	}
+	featureSummary := compactFeatureStateForPrompt(missionDir, featureLimit)
+	contractSummary := truncateBlock(compactContract(filepath.Join(missionDir, "validation-contract.md")), contractLimit)
+	knowledgeSummary := truncateBlock(CompactKnowledge(knowledgeContent), knowledgeLimit)
+
+	return strings.Join([]string{
+		"IMPORTANT: Output ONLY JSON.",
+		"Analyze the current spec versus current mission artifacts and identify ONLY impactful changes.",
+		"Do NOT propose implementation steps. Do NOT use tools.",
+		"",
+		"## Current Spec Coverage Snapshot",
+		"",
+		specCoverage,
+		"",
+		"## Current Feature State (compact)",
+		"",
+		featureSummary,
+		"",
+		"## Current Validation Contract (compact)",
+		"",
+		contractSummary,
+		"",
+		"## Current Knowledge (compact, context only)",
+		"",
+		knowledgeSummary,
+		"",
+		"## Output schema",
+		"",
+		`{"changed_requirements":["..."],"assertion_impact_ids":["ui.3"],"feature_impact_ids":["F04"],"feature_actions":["add|update|remove ..."],"notes":"..."}`,
+	}, "\n")
+}
+
+func BuildChangesAssertionsPrompt(specDir, missionDir, projectDir, changesScopeJSON, retryFeedback string, tight bool) string {
+	_ = projectDir
+	specContent := readFileContent(filepath.Join(specDir, "spec.md"))
+	specCoverage := extractSpecStructure(specContent)
+	if specCoverage == "" {
+		specCoverage = specContent
+	}
+	specLimit := 7000
+	contractLimit := 2600
+	if tight {
+		specLimit = 3000
+		contractLimit = 1300
+	}
+	specCoverage = truncateBlock(specCoverage, specLimit)
+	currentContract := truncateBlock(compactContract(filepath.Join(missionDir, "validation-contract.md")), contractLimit)
+	if currentContract == "" {
+		currentContract = truncateBlock(readFileContent(filepath.Join(missionDir, "validation-contract.md")), contractLimit)
+	}
+
+	var parts []string
+	parts = append(parts,
+		"IMPORTANT: Output ONLY JSON.",
+		"Changes mode: output ONLY assertion delta for impacted requirements.",
+		"Maintain stable IDs and avoid full contract regeneration.",
+		"Do NOT use tools.",
+		"",
+	)
+
+	if retryFeedback != "" {
+		parts = append(parts,
+			"## Previous attempt had coverage gaps. Fix these before re-emitting:",
+			"",
+			retryFeedback,
+			"",
+		)
+	}
+
+	parts = append(parts,
+		"## Changes Analysis (source of scope)",
+		"",
+		changesScopeJSON,
+		"",
+		"## Current Spec Coverage Snapshot",
+		"",
+		specCoverage,
+		"",
+		"## Existing validation-contract.md (compact)",
+		"",
+		currentContract,
+		"",
+		"## Rules",
+		"",
+		"- Output delta only: changed/new assertions in upsert; obsolete assertion IDs in remove.",
+		"- Do NOT emit unchanged assertions.",
+		"- Keep IDs stable for unaffected assertions.",
+		"- If no assertion changes are required, output empty upsert/remove arrays.",
+		"",
+		"## Output",
+		"",
+		`Output ONLY {"assertion_delta":{"upsert":[{"id":"ui.1","category":"ui","assertion":"ui.1: ..."}],"remove":["ui.9"]}}.`,
+	)
+
+	return strings.Join(parts, "\n")
+}
+
+func BuildChangesFeaturesPrompt(specDir, missionDir, projectDir string, assertionIDs map[string][]string, changesScopeJSON, retryFeedback string, tight bool) string {
+	_ = projectDir
+	specContent := readFileContent(filepath.Join(specDir, "spec.md"))
+	specCoverage := extractSpecStructure(specContent)
+	if specCoverage == "" {
+		specCoverage = specContent
+	}
+	specLimit := 6000
+	featureLimit := 140
+	if tight {
+		specLimit = 2600
+		featureLimit = 70
+	}
+	specCoverage = truncateBlock(specCoverage, specLimit)
+	featureSummary := compactFeatureStateForPrompt(missionDir, featureLimit)
+	filteredIDs := filterAssertionIDsForChanges(assertionIDs, changesScopeJSON)
+
+	var parts []string
+	parts = append(parts,
+		"IMPORTANT: Output ONLY JSON.",
+		"Changes mode: output ONLY feature delta for impacted scope.",
+		"Do NOT create unrelated new features and do NOT rebuild full features.json.",
+		"Do NOT use tools.",
+		"",
+	)
+
+	if retryFeedback != "" {
+		parts = append(parts,
+			"## Previous attempt had coverage gaps. Fix these before re-emitting:",
+			"",
+			retryFeedback,
+			"",
+		)
+	}
+
+	parts = append(parts,
+		"## Changes Analysis (source of scope)",
+		"",
+		changesScopeJSON,
+		"",
+		"## Current Spec Coverage Snapshot",
+		"",
+		specCoverage,
+		"",
+		"## Existing features snapshot (compact)",
+		"",
+		featureSummary,
+		"",
+		"## Assertion IDs to cover",
+		"",
+		formatAssertionIDList(filteredIDs),
+		"",
+		"## Rules",
+		"",
+		"- Output delta only with upsert/remove. Do NOT emit unchanged features.",
+		"- Never remove or mutate done/validated features.",
+		"- Focus modifications/additions only on impacted scope from Changes Analysis.",
+		"- Every assertion ID must be covered by >=1 feature.validation_refs after merge.",
+		"- Remove only obsolete pending/non-terminal features.",
+		"- Maintain coherent phase ordering and depends_on.",
+		"- Anti-over-generation: if uncertain, prefer NO change over speculative features.",
+		"- If no feature changes are required, output empty upsert/remove arrays.",
+		"",
+		"## Output",
+		"",
+		`Output ONLY {"feature_delta":{"upsert":[{"id":"F09","title":"...","phase":1,"status":"pending","depends_on":[],"scope":"...","description":"...","validation_refs":["ui.1"]}],"remove":["F03"]}}.`,
+	)
+
+	return strings.Join(parts, "\n")
 }
 
 func BuildRefinePlanPrompt(feedback, specDir, projectDir string) string {
@@ -1516,7 +1876,7 @@ func BuildRefinePlanPrompt(feedback, specDir, projectDir string) string {
 		fmt.Sprintf("%q", feedback),
 		"",
 		"Apply the feedback and output ONLY a valid JSON object (no markdown, no explanation, no code fences) matching this schema:",
-		`{"slug":"...","spec":"docs/specs/<slug>/spec.md","project":"...","owner":"...","features":[{"id":"F01","title":"...","phase":0,"depends_on":[],"scope":"...","validation_refs":["cat.1"]}],"assertions":[{"category":"cat","items":["cat.1: Assertion"]}],"knowledge":["..."]}`,
+		`{"slug":"...","spec":"docs/specs/<slug>/spec.md","project":"...","owner":"...","features":[{"id":"F01","title":"...","phase":0,"depends_on":[],"scope":"...","description":"...","validation_refs":["cat.1"]}],"assertions":[{"category":"cat","items":["cat.1: Assertion"]}],"knowledge":["..."]}`,
 		"",
 		"Preserve existing structure unless the feedback explicitly asks to change it.",
 		"Output ONLY the JSON object, nothing else.",
@@ -1658,9 +2018,32 @@ func BuildWorkerPrompt(feature Feature, siblings []string, contract, knowledge, 
 		fmt.Sprintf("Scope: %s", feature.Scope),
 		fmt.Sprintf("Phase: %d", feature.Phase),
 	)
+	if strings.TrimSpace(feature.Description) != "" {
+		parts = append(parts, fmt.Sprintf("Description: %s", feature.Description))
+	}
 
 	if len(feature.DependsOn) > 0 {
 		parts = append(parts, fmt.Sprintf("Dependencies (already implemented): %s", strings.Join(feature.DependsOn, ", ")))
+	}
+	if feature.Fixes != "" {
+		parts = append(parts,
+			fmt.Sprintf("Fixes root feature: %s", feature.Fixes),
+		)
+		if feature.RootCauseHypothesis != "" {
+			parts = append(parts, fmt.Sprintf("Root cause hypothesis: %s", feature.RootCauseHypothesis))
+		}
+		if len(feature.DoneWhen) > 0 {
+			parts = append(parts, "Done-when checklist:")
+			for _, item := range feature.DoneWhen {
+				parts = append(parts, "- "+item)
+			}
+		}
+		if len(feature.NonGoals) > 0 {
+			parts = append(parts, "Non-goals (do not implement):")
+			for _, item := range feature.NonGoals {
+				parts = append(parts, "- "+item)
+			}
+		}
 	}
 
 	if len(siblings) > 0 {

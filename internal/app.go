@@ -19,6 +19,12 @@ import (
 
 const margin = 2
 
+const (
+	changesPhaseSoftBudget        = 3*time.Minute + 30*time.Second
+	changesPhaseHardBudget        = 5 * time.Minute
+	changesPhaseTimeoutMaxRetries = 1
+)
+
 func sendNotification(title, message string) tea.Cmd {
 	return func() tea.Msg {
 		exec.Command("osascript", "-e",
@@ -36,22 +42,33 @@ type Model struct {
 	forceSetup    bool
 	ready         bool
 
-	specs            []SpecEntry
-	specCursor       int
-	activeSpec       *SpecEntry
-	editingSpec      bool
-	genPhase         GenPhase
-	genStartTime     time.Time
-	pendingFeatures  []Feature
-	knowledgeResult  *string
-	verbose          bool
-	confirmRegen     bool
-	confirmFullReset int
-	lastPrompt       string
-	claudeExtraArgs  []string
-	claudeRetries    int
-	claudeSessionID  string
-	claudeResumeHint string
+	specs              []SpecEntry
+	specCursor         int
+	activeSpec         *SpecEntry
+	editingSpec        bool
+	genPhase           GenPhase
+	fullRegenMode      bool
+	regenMode          bool
+	changesMode        bool
+	changesScopeJSON   string
+	changesPromptTight bool
+	changesSoftWarned  bool
+	changesTimeoutSent bool
+	changesTimeouts    int
+	genStartTime       time.Time
+	pendingFeatures    []Feature
+	knowledgeResult    *string
+	verbose            bool
+	confirmRegen       bool // G: full regenerate
+	confirmDelta       bool // U: delta update
+	confirmChanges     bool // C: changes intelligent
+	confirmSkipCritic  bool // Shift+S: start all skipping critic gate
+	confirmFullReset   int
+	lastPrompt         string
+	claudeExtraArgs    []string
+	claudeRetries      int
+	claudeSessionID    string
+	claudeResumeHint   string
 
 	// v2 spec-to-quest split-call state.
 	assertionIDs    map[string][]string // produced by GenPhaseAssertions, consumed by GenPhaseFeatures
@@ -291,6 +308,29 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case spinner.TickMsg:
 		if m.claudeRunning || m.executing || m.autoFixRunning {
+			if m.inChangesTimedPhase() && !m.claudeStartTime.IsZero() {
+				elapsed := time.Since(m.claudeStartTime)
+				phaseIdx := m.changesPhaseIndex()
+				if elapsed >= changesPhaseSoftBudget && !m.changesSoftWarned {
+					m.changesSoftWarned = true
+					m.discoveryMsgs = append(m.discoveryMsgs, ChatMessage{
+						Role: "system",
+						Text: fmt.Sprintf("PHASE_WARN_CHANGES:%d:%s:approaching 5m budget", phaseIdx, elapsed.Round(time.Second)),
+					})
+					m.viewport.SetContent(m.renderChatContent())
+					m.viewport.GotoBottom()
+				}
+				if elapsed >= changesPhaseHardBudget && !m.changesTimeoutSent {
+					m.changesTimeoutSent = true
+					m.discoveryMsgs = append(m.discoveryMsgs, ChatMessage{
+						Role: "system",
+						Text: fmt.Sprintf("PHASE_TIMEOUT_CHANGES:%d:%s:5m hard budget reached", phaseIdx, elapsed.Round(time.Second)),
+					})
+					StopClaude(m.claudeCmd)
+					m.viewport.SetContent(m.renderChatContent())
+					m.viewport.GotoBottom()
+				}
+			}
 			var cmd tea.Cmd
 			m.spinner, cmd = m.spinner.Update(msg)
 			cmds = append(cmds, cmd)
@@ -401,6 +441,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.lastPrompt = msg.prompt
 		m.claudeExtraArgs = msg.extraArgs
 		m.claudeStartTime = time.Now()
+		if m.changesMode {
+			m.resetChangesPhaseBudgetTracking()
+		}
 		return m, listenClaude(msg.ch)
 
 	case tea.KeyMsg:
@@ -437,6 +480,59 @@ func (m Model) View() string {
 
 func (m Model) isChatPhase() bool {
 	return m.phase == PhaseDiscovery || m.phase == PhaseRunning
+}
+
+func (m Model) inChangesTimedPhase() bool {
+	if !m.changesMode || m.phase != PhaseRunning || !m.claudeRunning {
+		return false
+	}
+	switch m.genPhase {
+	case GenPhaseAnalysis, GenPhaseAssertions, GenPhaseFeatures:
+		return true
+	default:
+		return false
+	}
+}
+
+func (m Model) changesPhaseIndex() int {
+	switch m.genPhase {
+	case GenPhaseAnalysis:
+		return 1
+	case GenPhaseAssertions:
+		return 2
+	case GenPhaseFeatures:
+		return 3
+	case GenPhaseCritic:
+		return 4
+	case GenPhaseFixLoop:
+		return 5
+	default:
+		return 0
+	}
+}
+
+func (m *Model) resetChangesPhaseBudgetTracking() {
+	m.changesSoftWarned = false
+	m.changesTimeoutSent = false
+}
+
+func (m *Model) ensureCriticSelectionState() {
+	if len(m.criticAdvisory) == 0 {
+		m.criticSelected = nil
+		m.criticCursor = 0
+		return
+	}
+	if len(m.criticSelected) != len(m.criticAdvisory) {
+		resized := make([]bool, len(m.criticAdvisory))
+		copy(resized, m.criticSelected)
+		m.criticSelected = resized
+	}
+	if m.criticCursor < 0 {
+		m.criticCursor = 0
+	}
+	if m.criticCursor >= len(m.criticAdvisory) {
+		m.criticCursor = len(m.criticAdvisory) - 1
+	}
 }
 
 func (m *Model) updateViewportSize() {
@@ -814,6 +910,7 @@ func (m Model) handleReviewKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	if m.reviewTab == ReviewTabCritic && len(m.criticAdvisory) > 0 {
+		m.ensureCriticSelectionState()
 		switch msg.String() {
 		case "up", "k":
 			if m.criticCursor > 0 {
@@ -828,7 +925,9 @@ func (m Model) handleReviewKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		case " ":
-			m.criticSelected[m.criticCursor] = !m.criticSelected[m.criticCursor]
+			if m.criticCursor >= 0 && m.criticCursor < len(m.criticSelected) {
+				m.criticSelected[m.criticCursor] = !m.criticSelected[m.criticCursor]
+			}
 			m.updateReviewContent()
 			return m, nil
 		}
@@ -852,9 +951,42 @@ func (m Model) handleDashboardKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		switch msg.String() {
 		case "y", "Y":
 			m.confirmRegen = false
-			return m.regenMissionPlan()
+			return m.fullRegenMissionPlan()
 		default:
 			m.confirmRegen = false
+			m.updateDashboardContent()
+			return m, nil
+		}
+	}
+	if m.confirmDelta {
+		switch msg.String() {
+		case "y", "Y":
+			m.confirmDelta = false
+			return m.regenMissionPlan()
+		default:
+			m.confirmDelta = false
+			m.updateDashboardContent()
+			return m, nil
+		}
+	}
+	if m.confirmChanges {
+		switch msg.String() {
+		case "y", "Y":
+			m.confirmChanges = false
+			return m.changesMissionPlan()
+		default:
+			m.confirmChanges = false
+			m.updateDashboardContent()
+			return m, nil
+		}
+	}
+	if m.confirmSkipCritic {
+		switch msg.String() {
+		case "y", "Y":
+			m.confirmSkipCritic = false
+			return m.startWorkersSkipCritic()
+		default:
+			m.confirmSkipCritic = false
 			m.updateDashboardContent()
 			return m, nil
 		}
@@ -947,6 +1079,15 @@ func (m Model) handleDashboardKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if !m.executing {
 			return m.startWorkers()
 		}
+	case "S":
+		if !m.executing && m.mission.Stats.Pending > 0 {
+			m.confirmRegen = false
+			m.confirmDelta = false
+			m.confirmChanges = false
+			m.confirmSkipCritic = true
+			m.updateDashboardContent()
+			return m, nil
+		}
 	case "e":
 		if !m.executing && m.activeSpec != nil {
 			m.editingSpec = true
@@ -978,13 +1119,35 @@ func (m Model) handleDashboardKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	case "R":
 		if !m.executing {
+			m.confirmSkipCritic = false
 			m.confirmFullReset = 1
 			m.updateDashboardContent()
 			return m, nil
 		}
 	case "G":
 		if !m.executing && m.activeSpec != nil {
+			m.confirmDelta = false
+			m.confirmChanges = false
+			m.confirmSkipCritic = false
 			m.confirmRegen = true
+			m.updateDashboardContent()
+			return m, nil
+		}
+	case "U":
+		if !m.executing && m.activeSpec != nil {
+			m.confirmRegen = false
+			m.confirmChanges = false
+			m.confirmSkipCritic = false
+			m.confirmDelta = true
+			m.updateDashboardContent()
+			return m, nil
+		}
+	case "C":
+		if !m.executing && m.activeSpec != nil {
+			m.confirmRegen = false
+			m.confirmDelta = false
+			m.confirmSkipCritic = false
+			m.confirmChanges = true
 			m.updateDashboardContent()
 			return m, nil
 		}
@@ -1075,6 +1238,10 @@ func (m Model) generateMissionFromSpec(spec SpecEntry) (tea.Model, tea.Cmd) {
 	m.genStartTime = now
 	m.editingSpec = true
 	m.genPhase = GenPhaseAnalysis
+	m.fullRegenMode = false
+	m.regenMode = false
+	m.changesMode = false
+	m.changesScopeJSON = ""
 	m.pendingFeatures = nil
 	m.knowledgeResult = nil
 	m.criticPassed = false
@@ -1086,7 +1253,7 @@ func (m Model) generateMissionFromSpec(spec SpecEntry) (tea.Model, tea.Cmd) {
 	m.discoveryMsgs = []ChatMessage{
 		{Role: "system", Text: fmt.Sprintf("Preparing quest plan for %s", spec.Slug)},
 		{Role: "system", Text: "This will analyze your codebase and generate the execution plan."},
-		{Role: "system", Text: "Estimated time: 5-10 minutes across 4 phases."},
+		{Role: "system", Text: "Estimated time: 5-10 minutes across 6 phases."},
 		{Role: "system", Text: ""},
 		{Role: "system", Text: "PHASE_ROADMAP"},
 		{Role: "system", Text: ""},
@@ -1124,18 +1291,60 @@ func (m Model) generateMissionFromSpec(spec SpecEntry) (tea.Model, tea.Cmd) {
 func (m Model) genPhaseLabel() string {
 	switch m.genPhase {
 	case GenPhaseAnalysis:
+		if m.changesMode {
+			return "sonnet · phase 1/5"
+		}
 		return "sonnet · phase 1/6"
 	case GenPhaseAssertions:
+		if m.changesMode {
+			return "opus · phase 2/5"
+		}
+		if m.regenMode {
+			return "opus · phase 1/4"
+		}
 		return "opus · phase 2/6"
 	case GenPhaseFeatures:
+		if m.changesMode {
+			return "opus · phase 3/5"
+		}
+		if m.regenMode {
+			return "opus · phase 2/4"
+		}
 		return "opus · phase 3/6"
 	case GenPhaseKnowledge:
 		return "sonnet · phase 4/6"
 	case GenPhaseCritic:
+		if m.changesMode {
+			return "sonnet · phase 4/5"
+		}
+		if m.regenMode {
+			return "sonnet · phase 3/4"
+		}
+		if m.fullRegenMode {
+			return "sonnet · phase 2/3"
+		}
 		return "sonnet · phase 5/6"
 	case GenPhaseFixLoop:
+		if m.changesMode {
+			return "sonnet · phase 5/5"
+		}
+		if m.regenMode {
+			return "sonnet · phase 4/4"
+		}
+		if m.fullRegenMode {
+			return "sonnet · phase 3/3"
+		}
 		return "sonnet · phase 6/6"
 	default:
+		if m.fullRegenMode {
+			return "opus · phase 1/3"
+		}
+		if m.regenMode {
+			return "opus · phase 1/4"
+		}
+		if m.changesMode {
+			return "sonnet · phase 1/5"
+		}
 		return "opus"
 	}
 }
@@ -1182,6 +1391,34 @@ func (m Model) nextGenPhase(result string) (tea.Model, tea.Cmd) {
 
 	switch m.genPhase {
 	case GenPhaseAnalysis:
+		if m.changesMode {
+			scope := strings.TrimSpace(result)
+			if scope == "" {
+				return m.retryGenPhase("Changes analysis returned empty result")
+			}
+			m.changesScopeJSON = scope
+			m.discoveryMsgs = append(m.discoveryMsgs, ChatMessage{
+				Role: "system",
+				Text: fmt.Sprintf("PHASE_DONE_CHANGES:1:%s:semantic change analysis captured", elapsed),
+			})
+
+			m.genPhase = GenPhaseAssertions
+			m.changesPromptTight = false
+			m.changesTimeouts = 0
+			m.resetChangesPhaseBudgetTracking()
+			m.discoveryMsgs = append(m.discoveryMsgs, ChatMessage{Role: "system", Text: "PHASE_START_CHANGES:2"})
+			m.streamLines = nil
+			m.claudeRunning = true
+			m.claudeStartTime = time.Now()
+			m.claudeRetries = 0
+			m.coverageRetries = 0
+			m.claudeSessionID = ""
+			m.claudeResumeHint = ""
+			m.viewport.SetContent(m.renderChatContent())
+			m.viewport.GotoBottom()
+
+			return m, m.spawnChangesAssertionsCall(specPath, mDir, projectDir, verboseVal, "")
+		}
 		ap := filepath.Join(mDir, "codebase-analysis.md")
 		existing := readFileContent(ap)
 		if result != "" {
@@ -1214,9 +1451,26 @@ func (m Model) nextGenPhase(result string) (tea.Model, tea.Cmd) {
 		return m, m.spawnAssertionsCall(specPath, projectDir, verboseVal, "")
 
 	case GenPhaseAssertions:
-		assertions, ok := ParseAssertionsOnlyJSON(result)
-		if !ok {
-			return m.retryGenPhase("Could not parse assertions output")
+		var (
+			assertions     []Assertion
+			ok             bool
+			assertionDelta AssertionDelta
+		)
+		if m.changesMode {
+			assertionDelta, ok = ParseAssertionDeltaJSON(result)
+			if !ok {
+				return m.retryGenPhase("Could not parse assertion delta output")
+			}
+			existingAssertions := parseAssertionsFromContract(filepath.Join(mDir, "validation-contract.md"))
+			assertions = ApplyAssertionDelta(existingAssertions, assertionDelta)
+			if len(assertions) == 0 {
+				return m.retryGenPhase("Assertion delta merged into empty contract")
+			}
+		} else {
+			assertions, ok = ParseAssertionsOnlyJSON(result)
+			if !ok {
+				return m.retryGenPhase("Could not parse assertions output")
+			}
 		}
 
 		spec := readFileContent(filepath.Join(specPath, "spec.md"))
@@ -1235,6 +1489,12 @@ func (m Model) nextGenPhase(result string) (tea.Model, tea.Cmd) {
 			m.claudeStartTime = time.Now()
 			m.viewport.SetContent(m.renderChatContent())
 			m.viewport.GotoBottom()
+			if m.changesMode {
+				return m, m.spawnChangesAssertionsCall(specPath, mDir, projectDir, verboseVal, feedback)
+			}
+			if m.regenMode {
+				return m, m.spawnRegenAssertionsCall(specPath, mDir, projectDir, verboseVal, feedback)
+			}
 			return m, m.spawnAssertionsCall(specPath, projectDir, verboseVal, feedback)
 		}
 
@@ -1252,6 +1512,49 @@ func (m Model) nextGenPhase(result string) (tea.Model, tea.Cmd) {
 		detailSuffix := ""
 		if len(issues) > 0 {
 			detailSuffix = fmt.Sprintf(" — %d coverage gap(s) accepted (critic phase will catch)", len(issues))
+		}
+		if m.changesMode {
+			m.discoveryMsgs = append(m.discoveryMsgs, ChatMessage{
+				Role: "system",
+				Text: fmt.Sprintf("PHASE_DONE_CHANGES:2:%s:%d assertions across %d categories (%d upsert, %d remove)%s", elapsed, totalAssertions, len(assertions), len(assertionDelta.Upsert), len(assertionDelta.Remove), detailSuffix),
+			})
+
+			m.genPhase = GenPhaseFeatures
+			m.changesPromptTight = false
+			m.changesTimeouts = 0
+			m.resetChangesPhaseBudgetTracking()
+			m.discoveryMsgs = append(m.discoveryMsgs, ChatMessage{Role: "system", Text: "PHASE_START_CHANGES:3"})
+			m.streamLines = nil
+			m.claudeRunning = true
+			m.claudeStartTime = time.Now()
+			m.claudeRetries = 0
+			m.coverageRetries = 0
+			m.claudeSessionID = ""
+			m.claudeResumeHint = ""
+			m.viewport.SetContent(m.renderChatContent())
+			m.viewport.GotoBottom()
+
+			return m, m.spawnChangesFeaturesCall(specPath, mDir, projectDir, m.assertionIDs, verboseVal, "")
+		}
+		if m.regenMode {
+			m.discoveryMsgs = append(m.discoveryMsgs, ChatMessage{
+				Role: "system",
+				Text: fmt.Sprintf("PHASE_DONE_REGEN:1:%s:%d assertions across %d categories%s", elapsed, totalAssertions, len(assertions), detailSuffix),
+			})
+
+			m.genPhase = GenPhaseFeatures
+			m.discoveryMsgs = append(m.discoveryMsgs, ChatMessage{Role: "system", Text: "PHASE_START_REGEN:2"})
+			m.streamLines = nil
+			m.claudeRunning = true
+			m.claudeStartTime = time.Now()
+			m.claudeRetries = 0
+			m.coverageRetries = 0
+			m.claudeSessionID = ""
+			m.claudeResumeHint = ""
+			m.viewport.SetContent(m.renderChatContent())
+			m.viewport.GotoBottom()
+
+			return m, m.spawnRegenFeaturesCall(specPath, mDir, projectDir, m.assertionIDs, verboseVal, "")
 		}
 		m.discoveryMsgs = append(m.discoveryMsgs, ChatMessage{
 			Role: "system",
@@ -1273,9 +1576,29 @@ func (m Model) nextGenPhase(result string) (tea.Model, tea.Cmd) {
 		return m, m.spawnFeaturesCall(specPath, projectDir, verboseVal, m.assertionIDs, "")
 
 	case GenPhaseFeatures:
-		features, ok := ParseFeaturesOnlyJSON(result)
-		if !ok {
-			return m.retryGenPhase("Could not parse features output")
+		var (
+			features     []Feature
+			ok           bool
+			featureDelta FeatureDelta
+		)
+		if m.changesMode {
+			featureDelta, ok = ParseFeatureDeltaJSON(result)
+			if !ok {
+				return m.retryGenPhase("Could not parse feature delta output")
+			}
+			var manifest FeaturesManifest
+			if data, err := os.ReadFile(filepath.Join(mDir, "features.json")); err == nil {
+				_ = json.Unmarshal(data, &manifest)
+			}
+			features = ApplyFeatureDelta(manifest.Features, featureDelta, true)
+			if len(features) == 0 {
+				return m.retryGenPhase("Feature delta merged into empty feature set")
+			}
+		} else {
+			features, ok = ParseFeaturesOnlyJSON(result)
+			if !ok {
+				return m.retryGenPhase("Could not parse features output")
+			}
 		}
 
 		issues := validateFeaturesCoverage(features, m.assertionIDs)
@@ -1293,6 +1616,12 @@ func (m Model) nextGenPhase(result string) (tea.Model, tea.Cmd) {
 			m.claudeStartTime = time.Now()
 			m.viewport.SetContent(m.renderChatContent())
 			m.viewport.GotoBottom()
+			if m.changesMode {
+				return m, m.spawnChangesFeaturesCall(specPath, mDir, projectDir, m.assertionIDs, verboseVal, feedback)
+			}
+			if m.regenMode {
+				return m, m.spawnRegenFeaturesCall(specPath, mDir, projectDir, m.assertionIDs, verboseVal, feedback)
+			}
 			return m, m.spawnFeaturesCall(specPath, projectDir, verboseVal, m.assertionIDs, feedback)
 		}
 
@@ -1301,6 +1630,115 @@ func (m Model) nextGenPhase(result string) (tea.Model, tea.Cmd) {
 		detailSuffix := ""
 		if len(issues) > 0 {
 			detailSuffix = fmt.Sprintf(" — %d coverage gap(s) accepted", len(issues))
+		}
+		if m.changesMode {
+			project := extractSpecTitle(specPath)
+			if project == "" {
+				project = filepath.Base(specPath)
+			}
+			slug := ""
+			if m.activeSpec != nil {
+				slug = m.activeSpec.Slug
+			}
+			if slug == "" {
+				slug = filepath.Base(specPath)
+			}
+
+			assertions := parseAssertionsFromContract(filepath.Join(mDir, "validation-contract.md"))
+			knowledgePath := filepath.Join(mDir, "knowledge-base.md")
+			existingKnowledge := readFileContent(knowledgePath)
+
+			plan := PlanData{
+				Slug:       slug,
+				Spec:       fmt.Sprintf("docs/specs/%s/spec.md", slug),
+				Project:    project,
+				Owner:      "",
+				Features:   features,
+				Assertions: assertions,
+				Knowledge:  []string{},
+			}
+			_ = WriteMissionFiles(specPath, m.projectDir, plan)
+			if existingKnowledge != "" {
+				_ = os.WriteFile(knowledgePath, []byte(existingKnowledge), 0o644)
+			}
+
+			m.missionDir = mDir
+			m.activeSpec = &SpecEntry{Slug: slug, SpecPath: specPath}
+			m.mission = ReadMissionState(mDir)
+			m.editingSpec = false
+
+			totalAssertions := 0
+			for _, a := range assertions {
+				totalAssertions += len(a.Items)
+			}
+			m.discoveryMsgs = append(m.discoveryMsgs, ChatMessage{
+				Role: "system",
+				Text: fmt.Sprintf("PHASE_DONE_CHANGES:3:%s:%d features, %d assertions refreshed (%d upsert, %d remove)%s", elapsed, len(features), totalAssertions, len(featureDelta.Upsert), len(featureDelta.Remove), detailSuffix),
+			})
+			m.changesPromptTight = false
+			m.changesTimeouts = 0
+			m.resetChangesPhaseBudgetTracking()
+			m.streamLines = nil
+			m.claudeRetries = 0
+			m.claudeSessionID = ""
+			m.claudeResumeHint = ""
+			m.viewport.SetContent(m.renderChatContent())
+			m.viewport.GotoBottom()
+
+			return m.startCriticLoop()
+		}
+		if m.regenMode {
+			project := extractSpecTitle(specPath)
+			if project == "" {
+				project = filepath.Base(specPath)
+			}
+			slug := ""
+			if m.activeSpec != nil {
+				slug = m.activeSpec.Slug
+			}
+			if slug == "" {
+				slug = filepath.Base(specPath)
+			}
+
+			assertions := parseAssertionsFromContract(filepath.Join(mDir, "validation-contract.md"))
+			knowledgePath := filepath.Join(mDir, "knowledge-base.md")
+			existingKnowledge := readFileContent(knowledgePath)
+
+			plan := PlanData{
+				Slug:       slug,
+				Spec:       fmt.Sprintf("docs/specs/%s/spec.md", slug),
+				Project:    project,
+				Owner:      "",
+				Features:   features,
+				Assertions: assertions,
+				Knowledge:  []string{},
+			}
+			_ = WriteMissionFiles(specPath, m.projectDir, plan)
+			if existingKnowledge != "" {
+				_ = os.WriteFile(knowledgePath, []byte(existingKnowledge), 0o644)
+			}
+
+			m.missionDir = mDir
+			m.activeSpec = &SpecEntry{Slug: slug, SpecPath: specPath}
+			m.mission = ReadMissionState(mDir)
+			m.editingSpec = false
+
+			totalAssertions := 0
+			for _, a := range assertions {
+				totalAssertions += len(a.Items)
+			}
+			m.discoveryMsgs = append(m.discoveryMsgs, ChatMessage{
+				Role: "system",
+				Text: fmt.Sprintf("PHASE_DONE_REGEN:2:%s:%d features, %d assertions refreshed%s", elapsed, len(features), totalAssertions, detailSuffix),
+			})
+			m.streamLines = nil
+			m.claudeRetries = 0
+			m.claudeSessionID = ""
+			m.claudeResumeHint = ""
+			m.viewport.SetContent(m.renderChatContent())
+			m.viewport.GotoBottom()
+
+			return m.startCriticLoop()
 		}
 		m.discoveryMsgs = append(m.discoveryMsgs, ChatMessage{
 			Role: "system",
@@ -1361,6 +1799,18 @@ func (m *Model) spawnAssertionsCall(specPath, projectDir string, verbose bool, r
 	}
 }
 
+// spawnRegenAssertionsCall starts regen phase 1: regenerate assertions only.
+func (m *Model) spawnRegenAssertionsCall(specPath, missionDir, projectDir string, verbose bool, retryFeedback string) tea.Cmd {
+	return func() tea.Msg {
+		prompt := BuildRegenAssertionsPrompt(specPath, missionDir, projectDir, retryFeedback)
+		ch := make(chan ClaudeStreamMsg, 64)
+		v := verbose
+		args := []string{"--allowedTools", "Read", "--max-turns", "1", "--model", "opus"}
+		cmd := StartClaude(prompt, projectDir, &v, ch, args...)
+		return contextReadyMsg{ch: ch, cmd: cmd, prompt: prompt, extraArgs: args}
+	}
+}
+
 // spawnFeaturesCall returns a tea.Cmd that builds the v2 Call 2 prompt and
 // starts the Claude subprocess. assertionIDs is the per-category map produced
 // by Call 1; retryFeedback is empty on the first attempt.
@@ -1370,6 +1820,51 @@ func (m *Model) spawnAssertionsCall(specPath, projectDir string, verbose bool, r
 func (m *Model) spawnFeaturesCall(specPath, projectDir string, verbose bool, assertionIDs map[string][]string, retryFeedback string) tea.Cmd {
 	return func() tea.Msg {
 		prompt := BuildFeaturesPrompt(specPath, projectDir, assertionIDs, retryFeedback)
+		ch := make(chan ClaudeStreamMsg, 64)
+		v := verbose
+		args := []string{"--allowedTools", "Read", "--max-turns", "1", "--model", "opus"}
+		cmd := StartClaude(prompt, projectDir, &v, ch, args...)
+		return contextReadyMsg{ch: ch, cmd: cmd, prompt: prompt, extraArgs: args}
+	}
+}
+
+// spawnRegenFeaturesCall starts regen phase 2: regenerate features only.
+func (m *Model) spawnRegenFeaturesCall(specPath, missionDir, projectDir string, assertionIDs map[string][]string, verbose bool, retryFeedback string) tea.Cmd {
+	return func() tea.Msg {
+		prompt := BuildRegenFeaturesPrompt(specPath, missionDir, projectDir, assertionIDs, retryFeedback)
+		ch := make(chan ClaudeStreamMsg, 64)
+		v := verbose
+		args := []string{"--allowedTools", "Read", "--max-turns", "1", "--model", "opus"}
+		cmd := StartClaude(prompt, projectDir, &v, ch, args...)
+		return contextReadyMsg{ch: ch, cmd: cmd, prompt: prompt, extraArgs: args}
+	}
+}
+
+func (m *Model) spawnChangesAnalysisCall(specPath, missionDir, projectDir string, verbose bool) tea.Cmd {
+	return func() tea.Msg {
+		prompt := BuildChangesDiffPrompt(specPath, missionDir, projectDir, m.changesPromptTight)
+		ch := make(chan ClaudeStreamMsg, 64)
+		v := verbose
+		args := []string{"--allowedTools", "Read", "--max-turns", "1", "--model", "claude-sonnet-4-6"}
+		cmd := StartClaude(prompt, projectDir, &v, ch, args...)
+		return contextReadyMsg{ch: ch, cmd: cmd, prompt: prompt, extraArgs: args}
+	}
+}
+
+func (m *Model) spawnChangesAssertionsCall(specPath, missionDir, projectDir string, verbose bool, retryFeedback string) tea.Cmd {
+	return func() tea.Msg {
+		prompt := BuildChangesAssertionsPrompt(specPath, missionDir, projectDir, m.changesScopeJSON, retryFeedback, m.changesPromptTight)
+		ch := make(chan ClaudeStreamMsg, 64)
+		v := verbose
+		args := []string{"--allowedTools", "Read", "--max-turns", "1", "--model", "opus"}
+		cmd := StartClaude(prompt, projectDir, &v, ch, args...)
+		return contextReadyMsg{ch: ch, cmd: cmd, prompt: prompt, extraArgs: args}
+	}
+}
+
+func (m *Model) spawnChangesFeaturesCall(specPath, missionDir, projectDir string, assertionIDs map[string][]string, verbose bool, retryFeedback string) tea.Cmd {
+	return func() tea.Msg {
+		prompt := BuildChangesFeaturesPrompt(specPath, missionDir, projectDir, assertionIDs, m.changesScopeJSON, retryFeedback, m.changesPromptTight)
 		ch := make(chan ClaudeStreamMsg, 64)
 		v := verbose
 		args := []string{"--allowedTools", "Read", "--max-turns", "1", "--model", "opus"}
@@ -1464,13 +1959,34 @@ func (m Model) finalizeGeneration(specPath, mDir string) (tea.Model, tea.Cmd) {
 	return m.startCriticLoop()
 }
 
-func (m Model) regenMissionPlan() (tea.Model, tea.Cmd) {
+func (m Model) fullRegenMissionPlan() (tea.Model, tea.Cmd) {
 	spec := m.activeSpec
 	m.phase = PhaseRunning
 	m.claudeRunning = true
-	m.claudeStartTime = time.Now()
+	now := time.Now()
+	m.claudeStartTime = now
+	m.genStartTime = now
 	m.editingSpec = true
-	m.discoveryMsgs = []ChatMessage{{Role: "system", Text: fmt.Sprintf("Regenerating quest plan for %s (preserving completed work)...", spec.Slug)}}
+	m.fullRegenMode = true
+	m.regenMode = false
+	m.changesMode = false
+	m.changesScopeJSON = ""
+	m.changesPromptTight = false
+	m.changesTimeouts = 0
+	m.resetChangesPhaseBudgetTracking()
+	m.genPhase = GenPhaseNone
+	m.criticLoopCount = 0
+	m.criticPassed = false
+	m.criticBypassed = false
+	m.discoveryMsgs = []ChatMessage{
+		{Role: "system", Text: fmt.Sprintf("Fully regenerating quest plan for %s (replanning all non-terminal work)...", spec.Slug)},
+		{Role: "system", Text: "This will regenerate the plan as a whole, then run critic validation."},
+		{Role: "system", Text: "Estimated time: 2-8 minutes across 3 phases."},
+		{Role: "system", Text: ""},
+		{Role: "system", Text: "PHASE_ROADMAP_FULL"},
+		{Role: "system", Text: ""},
+		{Role: "system", Text: "PHASE_START_FULL:1"},
+	}
 	m.streamLines = nil
 	m.claudeRetries = 0
 	m.claudeSessionID = ""
@@ -1490,9 +2006,106 @@ func (m Model) regenMissionPlan() (tea.Model, tea.Cmd) {
 			prompt := BuildRegenPlanPrompt(specPath, missionDir, projectDir)
 			ch := make(chan ClaudeStreamMsg, 64)
 			v := verboseVal
-			cmd := StartClaude(prompt, projectDir, &v, ch)
-			return contextReadyMsg{ch: ch, cmd: cmd, prompt: prompt}
+			args := []string{"--allowedTools", "Read", "--max-turns", "4", "--model", "opus"}
+			cmd := StartClaude(prompt, projectDir, &v, ch, args...)
+			return contextReadyMsg{ch: ch, cmd: cmd, prompt: prompt, extraArgs: args}
 		},
+	)
+}
+
+func (m Model) regenMissionPlan() (tea.Model, tea.Cmd) {
+	spec := m.activeSpec
+	m.phase = PhaseRunning
+	m.claudeRunning = true
+	now := time.Now()
+	m.claudeStartTime = now
+	m.genStartTime = now
+	m.editingSpec = true
+	m.fullRegenMode = false
+	m.regenMode = true
+	m.changesMode = false
+	m.changesScopeJSON = ""
+	m.changesPromptTight = false
+	m.changesTimeouts = 0
+	m.resetChangesPhaseBudgetTracking()
+	m.genPhase = GenPhaseAssertions
+	m.criticLoopCount = 0
+	m.criticPassed = false
+	m.criticBypassed = false
+	m.discoveryMsgs = []ChatMessage{
+		{Role: "system", Text: fmt.Sprintf("Regenerating quest plan for %s (preserving completed work)...", spec.Slug)},
+		{Role: "system", Text: "This will regenerate assertions and features, then run critic validation."},
+		{Role: "system", Text: "Estimated time: 1-4 minutes across 4 phases."},
+		{Role: "system", Text: ""},
+		{Role: "system", Text: "PHASE_ROADMAP_REGEN"},
+		{Role: "system", Text: ""},
+		{Role: "system", Text: "PHASE_START_REGEN:1"},
+	}
+	m.streamLines = nil
+	m.claudeRetries = 0
+	m.claudeSessionID = ""
+	m.claudeResumeHint = ""
+
+	m.viewport.SetContent(m.renderChatContent())
+	m.viewport.GotoBottom()
+
+	specPath := spec.SpecPath
+	missionDir := m.missionDir
+	projectDir := m.projectDir
+	verboseVal := m.verbose
+	regenAssertionsCmd := m.spawnRegenAssertionsCall(specPath, missionDir, projectDir, verboseVal, "")
+
+	return m, tea.Batch(
+		m.spinner.Tick,
+		regenAssertionsCmd,
+	)
+}
+
+func (m Model) changesMissionPlan() (tea.Model, tea.Cmd) {
+	spec := m.activeSpec
+	m.phase = PhaseRunning
+	m.claudeRunning = true
+	now := time.Now()
+	m.claudeStartTime = now
+	m.genStartTime = now
+	m.editingSpec = true
+	m.fullRegenMode = false
+	m.regenMode = false
+	m.changesMode = true
+	m.changesScopeJSON = ""
+	m.changesPromptTight = false
+	m.changesTimeouts = 0
+	m.resetChangesPhaseBudgetTracking()
+	m.genPhase = GenPhaseAnalysis
+	m.criticLoopCount = 0
+	m.criticPassed = false
+	m.criticBypassed = false
+	m.discoveryMsgs = []ChatMessage{
+		{Role: "system", Text: fmt.Sprintf("Analyzing spec changes for %s...", spec.Slug)},
+		{Role: "system", Text: "This will detect semantic changes first, then regenerate only impacted assertions/features."},
+		{Role: "system", Text: "Estimated time: 2-6 minutes across 5 phases."},
+		{Role: "system", Text: ""},
+		{Role: "system", Text: "PHASE_ROADMAP_CHANGES"},
+		{Role: "system", Text: ""},
+		{Role: "system", Text: "PHASE_START_CHANGES:1"},
+	}
+	m.streamLines = nil
+	m.claudeRetries = 0
+	m.claudeSessionID = ""
+	m.claudeResumeHint = ""
+
+	m.viewport.SetContent(m.renderChatContent())
+	m.viewport.GotoBottom()
+
+	specPath := spec.SpecPath
+	missionDir := m.missionDir
+	projectDir := m.projectDir
+	verboseVal := m.verbose
+	changesAnalysisCmd := m.spawnChangesAnalysisCall(specPath, missionDir, projectDir, verboseVal)
+
+	return m, tea.Batch(
+		m.spinner.Tick,
+		changesAnalysisCmd,
 	)
 }
 
@@ -1502,6 +2115,10 @@ func (m Model) startDiscovery() (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
+	m.fullRegenMode = false
+	m.regenMode = false
+	m.changesMode = false
+	m.changesScopeJSON = ""
 	m.input.Reset()
 	m.input.Blur()
 	m.discoveryMsgs = []ChatMessage{{Role: "user", Text: text}}
@@ -1532,6 +2149,10 @@ func (m Model) startDiscovery() (tea.Model, tea.Cmd) {
 
 func (m Model) sendDiscoveryFeedback(feedback string) (tea.Model, tea.Cmd) {
 	m.input.Reset()
+	m.fullRegenMode = false
+	m.regenMode = false
+	m.changesMode = false
+	m.changesScopeJSON = ""
 	m.input.Blur()
 	m.discoveryMsgs = append(m.discoveryMsgs, ChatMessage{Role: "user", Text: feedback})
 	m.streamLines = nil
@@ -1554,6 +2175,10 @@ func (m Model) sendDiscoveryFeedback(feedback string) (tea.Model, tea.Cmd) {
 
 func (m Model) approveRequirements() (tea.Model, tea.Cmd) {
 	m.phase = PhaseRunning
+	m.fullRegenMode = false
+	m.regenMode = false
+	m.changesMode = false
+	m.changesScopeJSON = ""
 	m.input.Blur()
 	m.streamLines = nil
 	m.claudeRunning = true
@@ -1750,7 +2375,15 @@ func (m Model) startCriticLoop() (tea.Model, tea.Cmd) {
 	m.criticPassed = false
 	m.criticBypassed = false
 
-	m.discoveryMsgs = append(m.discoveryMsgs, ChatMessage{Role: "system", Text: "PHASE_START:5"})
+	if m.changesMode {
+		m.discoveryMsgs = append(m.discoveryMsgs, ChatMessage{Role: "system", Text: "PHASE_START_CHANGES:4"})
+	} else if m.regenMode {
+		m.discoveryMsgs = append(m.discoveryMsgs, ChatMessage{Role: "system", Text: "PHASE_START_REGEN:3"})
+	} else if m.fullRegenMode {
+		m.discoveryMsgs = append(m.discoveryMsgs, ChatMessage{Role: "system", Text: "PHASE_START_FULL:2"})
+	} else {
+		m.discoveryMsgs = append(m.discoveryMsgs, ChatMessage{Role: "system", Text: "PHASE_START:5"})
+	}
 	m.streamLines = nil
 	m.viewport.SetContent(m.renderChatContent())
 	m.viewport.GotoBottom()
@@ -1819,7 +2452,15 @@ func (m Model) handleCriticLoopMsg(msg criticLoopMsg) (tea.Model, tea.Cmd) {
 	elapsed := time.Since(m.claudeStartTime).Round(time.Second)
 
 	if msg.err != nil {
-		m.discoveryMsgs = append(m.discoveryMsgs, ChatMessage{Role: "system", Text: fmt.Sprintf("PHASE_DONE:5:%s:error — %v", elapsed, msg.err)})
+		if m.changesMode {
+			m.discoveryMsgs = append(m.discoveryMsgs, ChatMessage{Role: "system", Text: fmt.Sprintf("PHASE_DONE_CHANGES:4:%s:error — %v", elapsed, msg.err)})
+		} else if m.regenMode {
+			m.discoveryMsgs = append(m.discoveryMsgs, ChatMessage{Role: "system", Text: fmt.Sprintf("PHASE_DONE_REGEN:3:%s:error — %v", elapsed, msg.err)})
+		} else if m.fullRegenMode {
+			m.discoveryMsgs = append(m.discoveryMsgs, ChatMessage{Role: "system", Text: fmt.Sprintf("PHASE_DONE_FULL:2:%s:error — %v", elapsed, msg.err)})
+		} else {
+			m.discoveryMsgs = append(m.discoveryMsgs, ChatMessage{Role: "system", Text: fmt.Sprintf("PHASE_DONE:5:%s:error — %v", elapsed, msg.err)})
+		}
 		m.viewport.SetContent(m.renderChatContent())
 		m.viewport.GotoBottom()
 		return m.transitionToReview()
@@ -1830,7 +2471,15 @@ func (m Model) handleCriticLoopMsg(msg criticLoopMsg) (tea.Model, tea.Cmd) {
 		if len(msg.advisory) > 0 {
 			detail += fmt.Sprintf(", %d advisory", len(msg.advisory))
 		}
-		m.discoveryMsgs = append(m.discoveryMsgs, ChatMessage{Role: "system", Text: fmt.Sprintf("PHASE_DONE:5:%s:%s", elapsed, detail)})
+		if m.changesMode {
+			m.discoveryMsgs = append(m.discoveryMsgs, ChatMessage{Role: "system", Text: fmt.Sprintf("PHASE_DONE_CHANGES:4:%s:%s", elapsed, detail)})
+		} else if m.regenMode {
+			m.discoveryMsgs = append(m.discoveryMsgs, ChatMessage{Role: "system", Text: fmt.Sprintf("PHASE_DONE_REGEN:3:%s:%s", elapsed, detail)})
+		} else if m.fullRegenMode {
+			m.discoveryMsgs = append(m.discoveryMsgs, ChatMessage{Role: "system", Text: fmt.Sprintf("PHASE_DONE_FULL:2:%s:%s", elapsed, detail)})
+		} else {
+			m.discoveryMsgs = append(m.discoveryMsgs, ChatMessage{Role: "system", Text: fmt.Sprintf("PHASE_DONE:5:%s:%s", elapsed, detail)})
+		}
 		m.criticAdvisory = msg.advisory
 		m.criticBlocking = nil
 		m.criticSelected = make([]bool, len(msg.advisory))
@@ -1847,7 +2496,15 @@ func (m Model) handleCriticLoopMsg(msg criticLoopMsg) (tea.Model, tea.Cmd) {
 	}
 
 	blockingCount := len(msg.blocking)
-	m.discoveryMsgs = append(m.discoveryMsgs, ChatMessage{Role: "system", Text: fmt.Sprintf("PHASE_DONE:5:%s:%d blocking findings", elapsed, blockingCount)})
+	if m.changesMode {
+		m.discoveryMsgs = append(m.discoveryMsgs, ChatMessage{Role: "system", Text: fmt.Sprintf("PHASE_DONE_CHANGES:4:%s:%d blocking findings", elapsed, blockingCount)})
+	} else if m.regenMode {
+		m.discoveryMsgs = append(m.discoveryMsgs, ChatMessage{Role: "system", Text: fmt.Sprintf("PHASE_DONE_REGEN:3:%s:%d blocking findings", elapsed, blockingCount)})
+	} else if m.fullRegenMode {
+		m.discoveryMsgs = append(m.discoveryMsgs, ChatMessage{Role: "system", Text: fmt.Sprintf("PHASE_DONE_FULL:2:%s:%d blocking findings", elapsed, blockingCount)})
+	} else {
+		m.discoveryMsgs = append(m.discoveryMsgs, ChatMessage{Role: "system", Text: fmt.Sprintf("PHASE_DONE:5:%s:%d blocking findings", elapsed, blockingCount)})
+	}
 
 	if len(m.streamLines) > 0 {
 		m.discoveryMsgs = append(m.discoveryMsgs, ChatMessage{Role: "assistant", Text: strings.Join(m.streamLines, "\n")})
@@ -1880,7 +2537,15 @@ func (m Model) startCriticFix(report *CriticReport) (tea.Model, tea.Cmd) {
 	m.claudeStartTime = time.Now()
 	m.streamLines = nil
 
-	m.discoveryMsgs = append(m.discoveryMsgs, ChatMessage{Role: "system", Text: "PHASE_START:6"})
+	if m.changesMode {
+		m.discoveryMsgs = append(m.discoveryMsgs, ChatMessage{Role: "system", Text: "PHASE_START_CHANGES:5"})
+	} else if m.regenMode {
+		m.discoveryMsgs = append(m.discoveryMsgs, ChatMessage{Role: "system", Text: "PHASE_START_REGEN:4"})
+	} else if m.fullRegenMode {
+		m.discoveryMsgs = append(m.discoveryMsgs, ChatMessage{Role: "system", Text: "PHASE_START_FULL:3"})
+	} else {
+		m.discoveryMsgs = append(m.discoveryMsgs, ChatMessage{Role: "system", Text: "PHASE_START:6"})
+	}
 	m.viewport.SetContent(m.renderChatContent())
 	m.viewport.GotoBottom()
 
@@ -1916,14 +2581,30 @@ func (m Model) handleCriticFixDone(msg criticFixDoneMsg) (tea.Model, tea.Cmd) {
 	elapsed := time.Since(m.claudeStartTime).Round(time.Second)
 
 	if msg.err != nil {
-		m.discoveryMsgs = append(m.discoveryMsgs, ChatMessage{Role: "system", Text: fmt.Sprintf("PHASE_DONE:6:%s:error — %v", elapsed, msg.err)})
+		if m.changesMode {
+			m.discoveryMsgs = append(m.discoveryMsgs, ChatMessage{Role: "system", Text: fmt.Sprintf("PHASE_DONE_CHANGES:5:%s:error — %v", elapsed, msg.err)})
+		} else if m.regenMode {
+			m.discoveryMsgs = append(m.discoveryMsgs, ChatMessage{Role: "system", Text: fmt.Sprintf("PHASE_DONE_REGEN:4:%s:error — %v", elapsed, msg.err)})
+		} else if m.fullRegenMode {
+			m.discoveryMsgs = append(m.discoveryMsgs, ChatMessage{Role: "system", Text: fmt.Sprintf("PHASE_DONE_FULL:3:%s:error — %v", elapsed, msg.err)})
+		} else {
+			m.discoveryMsgs = append(m.discoveryMsgs, ChatMessage{Role: "system", Text: fmt.Sprintf("PHASE_DONE:6:%s:error — %v", elapsed, msg.err)})
+		}
 		m.viewport.SetContent(m.renderChatContent())
 		m.viewport.GotoBottom()
 		return m.transitionToReview()
 	}
 
 	detail := fmt.Sprintf("fixes applied in %s", elapsed)
-	m.discoveryMsgs = append(m.discoveryMsgs, ChatMessage{Role: "system", Text: fmt.Sprintf("PHASE_DONE:6:%s:%s", elapsed, detail)})
+	if m.changesMode {
+		m.discoveryMsgs = append(m.discoveryMsgs, ChatMessage{Role: "system", Text: fmt.Sprintf("PHASE_DONE_CHANGES:5:%s:%s", elapsed, detail)})
+	} else if m.regenMode {
+		m.discoveryMsgs = append(m.discoveryMsgs, ChatMessage{Role: "system", Text: fmt.Sprintf("PHASE_DONE_REGEN:4:%s:%s", elapsed, detail)})
+	} else if m.fullRegenMode {
+		m.discoveryMsgs = append(m.discoveryMsgs, ChatMessage{Role: "system", Text: fmt.Sprintf("PHASE_DONE_FULL:3:%s:%s", elapsed, detail)})
+	} else {
+		m.discoveryMsgs = append(m.discoveryMsgs, ChatMessage{Role: "system", Text: fmt.Sprintf("PHASE_DONE:6:%s:%s", elapsed, detail)})
+	}
 
 	if len(m.streamLines) > 0 {
 		m.discoveryMsgs = append(m.discoveryMsgs, ChatMessage{Role: "assistant", Text: strings.Join(m.streamLines, "\n")})
@@ -1939,12 +2620,17 @@ func (m Model) handleCriticFixDone(msg criticFixDoneMsg) (tea.Model, tea.Cmd) {
 
 func (m Model) transitionToReview() (tea.Model, tea.Cmd) {
 	m.genPhase = GenPhaseNone
+	m.fullRegenMode = false
+	m.regenMode = false
+	m.changesMode = false
+	m.changesScopeJSON = ""
 	m.phase = PhaseReview
 	if len(m.criticAdvisory) > 0 || len(m.criticBlocking) > 0 {
 		m.reviewTab = ReviewTabCritic
 	} else {
 		m.reviewTab = ReviewTabChat
 	}
+	m.ensureCriticSelectionState()
 	m.reviewInput.Focus()
 	m.mission = ReadMissionState(m.missionDir)
 	m.updateReviewContent()
@@ -2051,6 +2737,12 @@ func (m *Model) resetFeatures(inclueDone bool) int {
 		return 0
 	}
 
+	all := make([]Feature, 0, len(manifest.Features)+len(manifest.FixFeatures))
+	all = append(all, manifest.Features...)
+	all = append(all, manifest.FixFeatures...)
+	tainted := loadTaintedFeatureIDs(m.missionDir, all)
+	outcomes := buildFeatureOutcomes(all, tainted)
+
 	count := 0
 	reset := func(features []Feature) {
 		for i := range features {
@@ -2060,6 +2752,11 @@ func (m *Model) resetFeatures(inclueDone bool) int {
 			}
 			if !inclueDone && (s == "done" || s == "validated") {
 				continue
+			}
+			if !inclueDone {
+				if out, ok := outcomes[features[i].ID]; ok && out.EffectiveDone {
+					continue
+				}
 			}
 			features[i].Status = "pending"
 			features[i].Resolution = ""
@@ -2315,6 +3012,61 @@ func (m Model) handleClaudeStream(msg ClaudeStreamMsg) (tea.Model, tea.Cmd) {
 	}
 
 	if msg.Err != nil {
+		if m.changesMode && m.phase == PhaseRunning && m.genPhase != GenPhaseNone && m.changesTimeoutSent {
+			m.changesTimeoutSent = false
+			phaseIdx := m.changesPhaseIndex()
+			if m.changesTimeouts < changesPhaseTimeoutMaxRetries {
+				m.changesTimeouts++
+				m.changesPromptTight = true
+				m.claudeRetries = 0
+				m.coverageRetries = 0
+				m.claudeSessionID = ""
+				m.claudeResumeHint = ""
+				m.claudeRunning = true
+				m.claudeStartTime = time.Now()
+				m.streamLines = nil
+				m.resetChangesPhaseBudgetTracking()
+				m.discoveryMsgs = append(m.discoveryMsgs, ChatMessage{
+					Role: "system",
+					Text: fmt.Sprintf("PHASE_FALLBACK_CHANGES:%d:restarting with tighter prompt budget", phaseIdx),
+				})
+				m.viewport.SetContent(m.renderChatContent())
+				m.viewport.GotoBottom()
+
+				specPath := ""
+				if m.activeSpec != nil {
+					specPath = m.activeSpec.SpecPath
+				}
+				if specPath == "" {
+					m.claudeRunning = false
+					m.genPhase = GenPhaseNone
+					m.discoveryMsgs = append(m.discoveryMsgs, ChatMessage{Role: "system", Text: "✕ Changes timeout fallback failed: missing spec path"})
+					m.viewport.SetContent(m.renderChatContent())
+					m.viewport.GotoBottom()
+					return m, sendNotification("Quest", "Changes mode aborted: missing spec path")
+				}
+				mDir := ResolveArtifactDir(specPath)
+				switch m.genPhase {
+				case GenPhaseAnalysis:
+					return m, m.spawnChangesAnalysisCall(specPath, mDir, m.projectDir, m.verbose)
+				case GenPhaseAssertions:
+					return m, m.spawnChangesAssertionsCall(specPath, mDir, m.projectDir, m.verbose, "Previous attempt exceeded the 5-minute budget. Emit the minimum safe delta.")
+				case GenPhaseFeatures:
+					return m, m.spawnChangesFeaturesCall(specPath, mDir, m.projectDir, m.assertionIDs, m.verbose, "Previous attempt exceeded the 5-minute budget. Emit the minimum safe delta.")
+				}
+			}
+
+			m.claudeRunning = false
+			m.genPhase = GenPhaseNone
+			m.discoveryMsgs = append(m.discoveryMsgs, ChatMessage{
+				Role: "system",
+				Text: fmt.Sprintf("✕ Changes phase %d exceeded the 5m budget after fallback — aborting", phaseIdx),
+			})
+			m.viewport.SetContent(m.renderChatContent())
+			m.viewport.GotoBottom()
+			return m, sendNotification("Quest", fmt.Sprintf("Changes phase %d exceeded 5m budget", phaseIdx))
+		}
+
 		maxRetries := 3
 		if m.phase == PhaseRunning && m.genPhase != GenPhaseNone {
 			maxRetries = 5
@@ -2412,10 +3164,56 @@ func (m Model) handleClaudeStream(msg ClaudeStreamMsg) (tea.Model, tea.Cmd) {
 					specDir = filepath.Join(m.projectDir, "docs", "specs", plan.Slug)
 					missionDir = ResolveArtifactDir(specDir)
 				}
+				knowledgePath := filepath.Join(missionDir, "knowledge-base.md")
+				existingKnowledge := ""
+				if m.regenMode {
+					existingKnowledge = readFileContent(knowledgePath)
+				}
 				_ = WriteMissionFiles(specDir, m.projectDir, *plan)
+				if m.regenMode && existingKnowledge != "" && len(plan.Knowledge) == 0 {
+					_ = os.WriteFile(knowledgePath, []byte(existingKnowledge), 0o644)
+				}
 				m.missionDir = missionDir
 				m.activeSpec = &SpecEntry{Slug: plan.Slug, SpecPath: specDir}
 				m.mission = ReadMissionState(missionDir)
+				if m.fullRegenMode {
+					elapsed := time.Since(m.claudeStartTime).Round(time.Second)
+					totalAssertions := 0
+					for _, a := range plan.Assertions {
+						totalAssertions += len(a.Items)
+					}
+					m.discoveryMsgs = append(m.discoveryMsgs, ChatMessage{
+						Role: "system",
+						Text: fmt.Sprintf("PHASE_DONE_FULL:1:%s:%d features, %d assertions refreshed", elapsed, len(plan.Features), totalAssertions),
+					})
+					m.editingSpec = false
+					m.streamLines = nil
+					m.claudeRetries = 0
+					m.claudeSessionID = ""
+					m.claudeResumeHint = ""
+					m.viewport.SetContent(m.renderChatContent())
+					m.viewport.GotoBottom()
+					return m.startCriticLoop()
+				}
+				if m.regenMode {
+					elapsed := time.Since(m.claudeStartTime).Round(time.Second)
+					totalAssertions := 0
+					for _, a := range plan.Assertions {
+						totalAssertions += len(a.Items)
+					}
+					m.discoveryMsgs = append(m.discoveryMsgs, ChatMessage{
+						Role: "system",
+						Text: fmt.Sprintf("PHASE_DONE_REGEN:1:%s:%d features, %d assertions refreshed", elapsed, len(plan.Features), totalAssertions),
+					})
+					m.editingSpec = false
+					m.streamLines = nil
+					m.claudeRetries = 0
+					m.claudeSessionID = ""
+					m.claudeResumeHint = ""
+					m.viewport.SetContent(m.renderChatContent())
+					m.viewport.GotoBottom()
+					return m.startCriticLoop()
+				}
 				m.editingSpec = false
 				m.phase = PhaseReview
 				m.reviewTab = ReviewTabChat
@@ -2534,8 +3332,8 @@ func (m Model) handleWorkerEvent(ev WorkerEvent) (tea.Model, tea.Cmd) {
 		return m, sendNotification(
 			"Mission",
 			fmt.Sprintf(
-				"Execution complete — %d/%d done (%d via fix), %d blocked unresolved, %d tainted",
-				stats.Done, stats.Total, stats.DoneViaFix, stats.BlockedUnresolved, stats.BlockedTainted,
+				"Execution complete — %d/%d done (%d via fix, %d waived), %d blocked unresolved, %d tainted",
+				stats.Done, stats.Total, stats.DoneViaFix, stats.DoneWaived, stats.BlockedUnresolved, stats.BlockedTainted,
 			),
 		)
 	}
@@ -2601,6 +3399,10 @@ func (m *Model) syncMissionWithPool() {
 				stats.DoneViaFix++
 				stats.BlockedResolved++
 				stats.BlockedTainted++
+			case ResolutionWaivedContract:
+				stats.DoneWaived++
+				stats.BlockedResolved++
+				stats.BlockedWaived++
 			default:
 				stats.BlockedUnresolved++
 			}
@@ -2614,7 +3416,7 @@ func (m *Model) syncMissionWithPool() {
 			stats.Refining++
 		}
 	}
-	stats.Done = stats.DoneDirect + stats.DoneViaFix
+	stats.Done = stats.DoneDirect + stats.DoneViaFix + stats.DoneWaived
 	m.mission.Stats = stats
 }
 
@@ -2775,9 +3577,205 @@ var phaseInfo = [6]struct{ model, desc string }{
 	{"sonnet", "Auto-fix"},
 }
 
+var regenPhaseInfo = [4]struct{ model, desc string }{
+	{"opus", "Spec → assertions (regen)"},
+	{"opus", "Spec → features (preserve completed)"},
+	{"sonnet", "Critic validation"},
+	{"sonnet", "Auto-fix"},
+}
+
+var fullRegenPhaseInfo = [3]struct{ model, desc string }{
+	{"opus", "Full regenerate plan"},
+	{"sonnet", "Critic validation"},
+	{"sonnet", "Auto-fix"},
+}
+
+var changesPhaseInfo = [5]struct{ model, desc string }{
+	{"sonnet", "Analyze spec changes"},
+	{"opus", "Assertions delta"},
+	{"opus", "Features delta"},
+	{"sonnet", "Critic validation"},
+	{"sonnet", "Auto-fix"},
+}
+
 func (m Model) renderSystemMsg(text string) string {
 	if text == "" {
 		return "\n"
+	}
+
+	if text == "PHASE_ROADMAP_REGEN" {
+		var sb strings.Builder
+		sb.WriteString("  " + m.styles.Dim.Render("─── Regeneration Pipeline ───────────────────") + "\n")
+		for i, p := range regenPhaseInfo {
+			num := fmt.Sprintf("  %d ", i+1)
+			model := fmt.Sprintf("%-6s", p.model)
+			sb.WriteString(m.styles.Blue.Render(num) + m.styles.Magenta.Render(model) + " " + m.styles.Dim.Render(p.desc) + "\n")
+		}
+		sb.WriteString("  " + m.styles.Dim.Render("─────────────────────────────────────────────") + "\n")
+		return sb.String()
+	}
+
+	if text == "PHASE_ROADMAP_FULL" {
+		var sb strings.Builder
+		sb.WriteString("  " + m.styles.Dim.Render("─── Full Regeneration Pipeline ──────────────") + "\n")
+		for i, p := range fullRegenPhaseInfo {
+			num := fmt.Sprintf("  %d ", i+1)
+			model := fmt.Sprintf("%-6s", p.model)
+			sb.WriteString(m.styles.Blue.Render(num) + m.styles.Magenta.Render(model) + " " + m.styles.Dim.Render(p.desc) + "\n")
+		}
+		sb.WriteString("  " + m.styles.Dim.Render("─────────────────────────────────────────────") + "\n")
+		return sb.String()
+	}
+
+	if text == "PHASE_ROADMAP_CHANGES" {
+		var sb strings.Builder
+		sb.WriteString("  " + m.styles.Dim.Render("─── Changes Pipeline ────────────────────────") + "\n")
+		for i, p := range changesPhaseInfo {
+			num := fmt.Sprintf("  %d ", i+1)
+			model := fmt.Sprintf("%-6s", p.model)
+			sb.WriteString(m.styles.Blue.Render(num) + m.styles.Magenta.Render(model) + " " + m.styles.Dim.Render(p.desc) + "\n")
+		}
+		sb.WriteString("  " + m.styles.Dim.Render("─────────────────────────────────────────────") + "\n")
+		return sb.String()
+	}
+
+	if strings.HasPrefix(text, "PHASE_START_REGEN:") {
+		idx := 0
+		fmt.Sscanf(text, "PHASE_START_REGEN:%d", &idx)
+		if idx >= 1 && idx <= len(regenPhaseInfo) {
+			p := regenPhaseInfo[idx-1]
+			return "\n" +
+				m.styles.Blue.Render(fmt.Sprintf("  ▶ Phase %d/%d", idx, len(regenPhaseInfo))) + " " +
+				m.styles.Magenta.Render(p.model) + " " +
+				m.styles.Dim.Render("— "+p.desc+"...") + "\n"
+		}
+	}
+
+	if strings.HasPrefix(text, "PHASE_DONE_REGEN:") {
+		parts := strings.SplitN(text, ":", 4)
+		if len(parts) == 4 {
+			idx := 0
+			fmt.Sscanf(parts[1], "%d", &idx)
+			elapsed := parts[2]
+			detail := parts[3]
+			if idx >= 1 && idx <= len(regenPhaseInfo) {
+				p := regenPhaseInfo[idx-1]
+				return m.styles.Green.Render(fmt.Sprintf("  ✓ Phase %d/%d", idx, len(regenPhaseInfo))) + " " +
+					m.styles.Magenta.Render(p.model) + " " +
+					m.styles.Dim.Render("— "+p.desc) + " " +
+					m.styles.Yellow.Render(elapsed) + " " +
+					m.styles.Dim.Render("("+detail+")") + "\n"
+			}
+		}
+	}
+
+	if strings.HasPrefix(text, "PHASE_START_FULL:") {
+		idx := 0
+		fmt.Sscanf(text, "PHASE_START_FULL:%d", &idx)
+		if idx >= 1 && idx <= len(fullRegenPhaseInfo) {
+			p := fullRegenPhaseInfo[idx-1]
+			return "\n" +
+				m.styles.Blue.Render(fmt.Sprintf("  ▶ Phase %d/%d", idx, len(fullRegenPhaseInfo))) + " " +
+				m.styles.Magenta.Render(p.model) + " " +
+				m.styles.Dim.Render("— "+p.desc+"...") + "\n"
+		}
+	}
+
+	if strings.HasPrefix(text, "PHASE_DONE_FULL:") {
+		parts := strings.SplitN(text, ":", 4)
+		if len(parts) == 4 {
+			idx := 0
+			fmt.Sscanf(parts[1], "%d", &idx)
+			elapsed := parts[2]
+			detail := parts[3]
+			if idx >= 1 && idx <= len(fullRegenPhaseInfo) {
+				p := fullRegenPhaseInfo[idx-1]
+				return m.styles.Green.Render(fmt.Sprintf("  ✓ Phase %d/%d", idx, len(fullRegenPhaseInfo))) + " " +
+					m.styles.Magenta.Render(p.model) + " " +
+					m.styles.Dim.Render("— "+p.desc) + " " +
+					m.styles.Yellow.Render(elapsed) + " " +
+					m.styles.Dim.Render("("+detail+")") + "\n"
+			}
+		}
+	}
+
+	if strings.HasPrefix(text, "PHASE_START_CHANGES:") {
+		idx := 0
+		fmt.Sscanf(text, "PHASE_START_CHANGES:%d", &idx)
+		if idx >= 1 && idx <= len(changesPhaseInfo) {
+			p := changesPhaseInfo[idx-1]
+			return "\n" +
+				m.styles.Blue.Render(fmt.Sprintf("  ▶ Phase %d/%d", idx, len(changesPhaseInfo))) + " " +
+				m.styles.Magenta.Render(p.model) + " " +
+				m.styles.Dim.Render("— "+p.desc+"...") + "\n"
+		}
+	}
+
+	if strings.HasPrefix(text, "PHASE_WARN_CHANGES:") {
+		parts := strings.SplitN(text, ":", 4)
+		if len(parts) == 4 {
+			idx := 0
+			fmt.Sscanf(parts[1], "%d", &idx)
+			elapsed := parts[2]
+			detail := parts[3]
+			if idx >= 1 && idx <= len(changesPhaseInfo) {
+				p := changesPhaseInfo[idx-1]
+				return m.styles.Yellow.Render(fmt.Sprintf("  ⚠ Phase %d/%d", idx, len(changesPhaseInfo))) + " " +
+					m.styles.Magenta.Render(p.model) + " " +
+					m.styles.Dim.Render("— "+detail) + " " +
+					m.styles.Yellow.Render(elapsed) + "\n"
+			}
+		}
+	}
+
+	if strings.HasPrefix(text, "PHASE_TIMEOUT_CHANGES:") {
+		parts := strings.SplitN(text, ":", 4)
+		if len(parts) == 4 {
+			idx := 0
+			fmt.Sscanf(parts[1], "%d", &idx)
+			elapsed := parts[2]
+			detail := parts[3]
+			if idx >= 1 && idx <= len(changesPhaseInfo) {
+				p := changesPhaseInfo[idx-1]
+				return m.styles.Red.Render(fmt.Sprintf("  ✕ Phase %d/%d", idx, len(changesPhaseInfo))) + " " +
+					m.styles.Magenta.Render(p.model) + " " +
+					m.styles.Dim.Render("— "+detail) + " " +
+					m.styles.Yellow.Render(elapsed) + "\n"
+			}
+		}
+	}
+
+	if strings.HasPrefix(text, "PHASE_FALLBACK_CHANGES:") {
+		parts := strings.SplitN(text, ":", 3)
+		if len(parts) == 3 {
+			idx := 0
+			fmt.Sscanf(parts[1], "%d", &idx)
+			detail := parts[2]
+			if idx >= 1 && idx <= len(changesPhaseInfo) {
+				p := changesPhaseInfo[idx-1]
+				return m.styles.Cyan.Render(fmt.Sprintf("  ↺ Phase %d/%d", idx, len(changesPhaseInfo))) + " " +
+					m.styles.Magenta.Render(p.model) + " " +
+					m.styles.Dim.Render("— "+detail) + "\n"
+			}
+		}
+	}
+
+	if strings.HasPrefix(text, "PHASE_DONE_CHANGES:") {
+		parts := strings.SplitN(text, ":", 4)
+		if len(parts) == 4 {
+			idx := 0
+			fmt.Sscanf(parts[1], "%d", &idx)
+			elapsed := parts[2]
+			detail := parts[3]
+			if idx >= 1 && idx <= len(changesPhaseInfo) {
+				p := changesPhaseInfo[idx-1]
+				return m.styles.Green.Render(fmt.Sprintf("  ✓ Phase %d/%d", idx, len(changesPhaseInfo))) + " " +
+					m.styles.Magenta.Render(p.model) + " " +
+					m.styles.Dim.Render("— "+p.desc) + " " +
+					m.styles.Yellow.Render(elapsed) + " " +
+					m.styles.Dim.Render("("+detail+")") + "\n"
+			}
+		}
 	}
 
 	if text == "PHASE_ROADMAP" {
@@ -2937,6 +3935,12 @@ func (m Model) renderReviewPlan() string {
 			for _, wl := range strings.Split(wrapped, "\n") {
 				sb.WriteString(m.styles.Dim.Render(fmt.Sprintf("      %s", wl)) + "\n")
 			}
+			if strings.TrimSpace(f.Description) != "" {
+				descWrapped := wrapStyle.Render("desc: " + f.Description)
+				for _, wl := range strings.Split(descWrapped, "\n") {
+					sb.WriteString(m.styles.Dim.Render(fmt.Sprintf("      %s", wl)) + "\n")
+				}
+			}
 			if len(f.ValidationRefs) > 0 {
 				sb.WriteString(m.styles.Dim.Render(fmt.Sprintf("      refs: %s\n", strings.Join(f.ValidationRefs, ", "))))
 			}
@@ -3065,7 +4069,7 @@ func (m Model) renderReviewCritic() string {
 
 		for i, f := range m.criticAdvisory {
 			checkbox := "☐"
-			if m.criticSelected[i] {
+			if i < len(m.criticSelected) && m.criticSelected[i] {
 				checkbox = "☑"
 			}
 
@@ -3280,9 +4284,10 @@ func (m Model) renderExecutingOverview(totalW, leftW, rightW, leftInner, rightIn
 	}
 	sb.WriteString(stats + "\n")
 	final := m.mission.Stats
-	finalLine := fmt.Sprintf("%s %d direct  %s %d via-fix  %s %d unresolved  %s %d tainted",
+	finalLine := fmt.Sprintf("%s %d direct  %s %d via-fix  %s %d waived  %s %d unresolved  %s %d tainted",
 		m.styles.StatusDone.Render("•"), final.DoneDirect,
 		m.styles.Green.Render("•"), final.DoneViaFix,
+		m.styles.Cyan.Render("•"), final.DoneWaived,
 		m.styles.StatusBlock.Render("•"), final.BlockedUnresolved,
 		m.styles.Yellow.Render("•"), final.BlockedTainted,
 	)
@@ -3415,9 +4420,10 @@ func (m Model) renderStaticOverview(totalW, leftW, rightW, leftInner, rightInner
 		statusLine += fmt.Sprintf("  %s %d refining", m.styles.StatusRefining.Render("⟳"), stats.Refining)
 	}
 	sb.WriteString(statusLine + "\n")
-	finalLine := fmt.Sprintf("%s %d direct  %s %d via-fix  %s %d unresolved  %s %d tainted",
+	finalLine := fmt.Sprintf("%s %d direct  %s %d via-fix  %s %d waived  %s %d unresolved  %s %d tainted",
 		m.styles.StatusDone.Render("•"), stats.DoneDirect,
 		m.styles.Green.Render("•"), stats.DoneViaFix,
+		m.styles.Cyan.Render("•"), stats.DoneWaived,
 		m.styles.StatusBlock.Render("•"), stats.BlockedUnresolved,
 		m.styles.Yellow.Render("•"), stats.BlockedTainted,
 	)
@@ -3445,6 +4451,9 @@ func (m Model) renderStaticOverview(totalW, leftW, rightW, leftInner, rightInner
 				for _, wl := range strings.Split(wrapped, "\n") {
 					left.WriteString(m.styles.Dim.Render(fmt.Sprintf("    %s", wl)) + "\n")
 				}
+			}
+			if strings.TrimSpace(f.Description) != "" {
+				left.WriteString(m.styles.Dim.Render(fmt.Sprintf("    desc: %s\n", truncatePreview(f.Description, 140))))
 			}
 		}
 		left.WriteString("\n")
@@ -3569,9 +4578,10 @@ func (m Model) renderKanbanTab() string {
 
 	stats := m.mission.Stats
 	summary := fmt.Sprintf(
-		"  %s %d direct  %s %d via-fix  %s %d unresolved  %s %d tainted",
+		"  %s %d direct  %s %d via-fix  %s %d waived  %s %d unresolved  %s %d tainted",
 		m.styles.StatusDone.Render("•"), stats.DoneDirect,
 		m.styles.Green.Render("•"), stats.DoneViaFix,
+		m.styles.Cyan.Render("•"), stats.DoneWaived,
 		m.styles.StatusBlock.Render("•"), stats.BlockedUnresolved,
 		m.styles.Yellow.Render("•"), stats.BlockedTainted,
 	)
@@ -3780,7 +4790,7 @@ func (m Model) dashboardView() string {
 		verboseLabel = "V: summary"
 	}
 
-	hasStuck := m.mission.Stats.InProgress > 0 || m.mission.Stats.Blocked > 0 || m.mission.Stats.AwaitingValidation > 0 || m.mission.Stats.Validating > 0 || m.mission.Stats.Refining > 0
+	hasStuck := m.mission.Stats.InProgress > 0 || m.mission.Stats.BlockedUnresolved > 0 || m.mission.Stats.AwaitingValidation > 0 || m.mission.Stats.Validating > 0 || m.mission.Stats.Refining > 0
 
 	var hintText string
 	if m.executing {
@@ -3793,7 +4803,7 @@ func (m Model) dashboardView() string {
 			parts = append(parts, fmt.Sprintf("↑↓: select · Enter: retry %s", sel.ID))
 		}
 		if m.mission.Stats.Pending > 0 {
-			parts = append(parts, "S: start all")
+			parts = append(parts, "S: start all", "Shift+S: skip critic")
 		}
 		if hasStuck {
 			parts = append(parts, "r: retry stuck")
@@ -3801,11 +4811,20 @@ func (m Model) dashboardView() string {
 		if len(m.mission.Features) > 0 {
 			parts = append(parts, "R: full reset (clear fixes)")
 		}
-		parts = append(parts, "G: regen plan", "E: edit spec", verboseLabel, "N: new", "Tab: switch", "q: quit")
+		parts = append(parts, "G: full regen", "U: update plan", "C: changes", "E: edit spec", verboseLabel, "N: new", "Tab: switch", "q: quit")
 		hintText = "  " + strings.Join(parts, " · ")
 	}
 	if m.confirmRegen {
-		hintText = "  ⚠ Regenerate quest plan? Completed features will be preserved. (Y: confirm · any key: cancel)"
+		hintText = "  ⚠ Full regenerate plan? Replans all non-terminal work. (Y: confirm · any key: cancel)"
+	}
+	if m.confirmDelta {
+		hintText = "  ⚠ Run Update Plan (delta)? Rebuild assertions/features incrementally. (Y: confirm · any key: cancel)"
+	}
+	if m.confirmChanges {
+		hintText = "  ⚠ Run Changes mode? Sonnet will analyze spec changes before planning. (Y: confirm · any key: cancel)"
+	}
+	if m.confirmSkipCritic {
+		hintText = "  ⚠ Start all WITHOUT critic gate? (Y: confirm · any key: cancel)"
 	}
 	if m.confirmFullReset == 1 {
 		hintText = "  ⚠ Full reset will clear fix_features and reset all root features to pending. (Y: continue · any key: cancel)"
@@ -3872,6 +4891,8 @@ func featureOutcomeSuffix(f Feature, s Styles) string {
 		return " " + s.Green.Render("[via-fix]")
 	case ResolutionResolvedTainted:
 		return " " + s.Yellow.Render("[tainted]")
+	case ResolutionWaivedContract:
+		return " " + s.Cyan.Render("[waived-contract]")
 	case ResolutionUnresolved:
 		if f.Status == "blocked" {
 			return " " + s.Red.Render("[unresolved]")

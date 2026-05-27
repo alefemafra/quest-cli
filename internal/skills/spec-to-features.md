@@ -91,6 +91,7 @@ Output ONLY a valid JSON object with the `features` key. NO knowledge field
       "phase": 0,
       "depends_on": [],
       "scope": "<detailed — specific enough for a worker with NO prior context>",
+      "description": "<why this feature exists, boundaries, and implementation cues>",
       "validation_refs": ["data.1", "data.2"]
     }
   ]
@@ -103,6 +104,8 @@ Output ONLY a valid JSON object with the `features` key. NO knowledge field
 - Every assertion ID provided in the input MUST be referenced by >=1 feature.validation_refs.
 - Every feature MUST have non-empty scope (target >=80 chars) describing schemas,
   validation rules, file paths, and API calls.
+- Every feature MUST include `description` (target >=120 chars) with intent,
+  boundaries, edge cases, and execution notes for the worker.
 - Every feature MUST have >=1 validation_refs entry.
 - Order features by `phase` (0..3) then by dependency.
 - `depends_on` must be accurate — list the IDs of features that produce code
@@ -114,6 +117,8 @@ Output ONLY a valid JSON object with the `features` key. NO knowledge field
 
 - **Vague feature scope.** "Build step 1" tells a worker nothing. List fields,
   schemas, validation rules, API calls.
+- **Scope-only output.** If `description` is missing, the worker lacks context
+  about intent, boundaries, and failure traps.
 - **Dropping assertion IDs.** If `ui.7` is not referenced by any feature, that
   behavior won't be implemented — every ID must be assigned.
 - **One giant feature.** If a feature has >8 `validation_refs`, split it.

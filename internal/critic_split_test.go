@@ -146,6 +146,36 @@ func TestBuildCriticPhasePrompt_C_OnlyDecomp(t *testing.T) {
 	}
 }
 
+func TestBuildCriticPhasePrompt_C_IgnoresDoneFeatureContent(t *testing.T) {
+	specDir := makeCriticSpecTree(t, map[string]string{
+		"validation-contract.md": "# contract",
+		"features.json": `{
+  "features": [
+    {"id":"F01","title":"DONE-MARKER-123","phase":0,"status":"done","scope":"done scope","validation_refs":["ui.1"]},
+    {"id":"F02","title":"PENDING-MARKER-456","phase":1,"status":"pending","scope":"pending scope","validation_refs":["ui.2"]}
+  ],
+  "fix_features": [
+    {"id":"FX01","title":"VALIDATED-MARKER-789","phase":1,"status":"validated","scope":"validated scope","validation_refs":["ui.3"]}
+  ]
+}`,
+	})
+
+	prompt := BuildCriticPhasePrompt(specDir, criticPhaseDecomp)
+
+	if strings.Contains(prompt, "DONE-MARKER-123") {
+		t.Fatalf("phase C prompt should not include done feature content")
+	}
+	if strings.Contains(prompt, "VALIDATED-MARKER-789") {
+		t.Fatalf("phase C prompt should not include validated feature content")
+	}
+	if !strings.Contains(prompt, "PENDING-MARKER-456") {
+		t.Fatalf("phase C prompt should include non-terminal feature content")
+	}
+	if !strings.Contains(prompt, "ignore features already in terminal status (done/validated)") {
+		t.Fatalf("phase C prompt should explicitly instruct ignoring done/validated features")
+	}
+}
+
 func TestBuildCriticPhasePrompt_InlinesArtifactContent(t *testing.T) {
 	specDir := makeCriticSpecTree(t, map[string]string{
 		"validation-contract.md": "ASSERTION-MARKER-XYZ\n",
@@ -308,5 +338,56 @@ func TestMergeCriticReports_OneErrored(t *testing.T) {
 	}
 	if !hasSyntheticBlock {
 		t.Errorf("expected phase-B-error in BlockingFindings, got %v", merged.BlockingFindings)
+	}
+}
+
+func TestSanitizeCriticReportForPhase_FiltersCrossPhaseCriteria(t *testing.T) {
+	report := &CriticReport{
+		Phase:   "all",
+		Overall: "needs-work",
+		Findings: []CriticFinding{
+			{Criterion: "J-S1", Status: "pass"},
+			{Criterion: "J-D1", Status: "needs-work", Target: "should not be in phase A"},
+		},
+	}
+
+	sanitized := sanitizeCriticReportForPhase(report, "A")
+	if sanitized.Phase != "A" {
+		t.Fatalf("expected phase A, got %q", sanitized.Phase)
+	}
+	if len(sanitized.Findings) != 1 || sanitized.Findings[0].Criterion != "J-S1" {
+		t.Fatalf("expected only J-S* finding, got %+v", sanitized.Findings)
+	}
+	if sanitized.Overall != "pass" {
+		t.Fatalf("expected overall pass after filtering cross-phase finding, got %q", sanitized.Overall)
+	}
+	if len(sanitized.BlockingFindings) != 0 {
+		t.Fatalf("expected no blocking findings, got %v", sanitized.BlockingFindings)
+	}
+}
+
+func TestSanitizeCriticReportForPhase_DedupesDuplicateCriterionPrefersNeedsWork(t *testing.T) {
+	report := &CriticReport{
+		Phase:   "C",
+		Overall: "needs-work",
+		Findings: []CriticFinding{
+			{Criterion: "J-D4", Status: "pass", Note: "duplicate pass"},
+			{Criterion: "J-D4", Status: "needs-work", Target: "actual problem"},
+			{Criterion: "J-A2", Status: "needs-work"},
+		},
+	}
+
+	sanitized := sanitizeCriticReportForPhase(report, "C")
+	if len(sanitized.Findings) != 1 {
+		t.Fatalf("expected one sanitized J-D4 finding, got %+v", sanitized.Findings)
+	}
+	if sanitized.Findings[0].Criterion != "J-D4" || sanitized.Findings[0].Status != "needs-work" {
+		t.Fatalf("expected J-D4 needs-work preserved, got %+v", sanitized.Findings[0])
+	}
+	if sanitized.Overall != "needs-work" {
+		t.Fatalf("expected overall needs-work, got %q", sanitized.Overall)
+	}
+	if len(sanitized.BlockingFindings) != 1 || sanitized.BlockingFindings[0] != "J-D4" {
+		t.Fatalf("expected blocking [J-D4], got %v", sanitized.BlockingFindings)
 	}
 }

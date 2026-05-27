@@ -408,7 +408,12 @@ func TestValidateAssertionsCoverage_EndpointMissingErrorPath(t *testing.T) {
 
 func TestValidateFeaturesCoverage_OrphanedID(t *testing.T) {
 	features := []Feature{
-		{ID: "F01", Scope: "Author Zod schemas covering required fields and validation rules across all entities.", ValidationRefs: []string{"ui.1"}},
+		{
+			ID:             "F01",
+			Scope:          "Author Zod schemas covering required fields and validation rules across all entities.",
+			Description:    "Define canonical event schema, ensure cross-form constraints, and keep parsing behavior aligned with existing domain adapters.",
+			ValidationRefs: []string{"ui.1"},
+		},
 	}
 	knownIDs := map[string][]string{
 		"ui":   {"ui.1", "ui.2"},
@@ -426,7 +431,12 @@ func TestValidateFeaturesCoverage_OrphanedID(t *testing.T) {
 
 func TestValidateFeaturesCoverage_ShortScope(t *testing.T) {
 	features := []Feature{
-		{ID: "F01", Scope: "Too short.", ValidationRefs: []string{"ui.1"}},
+		{
+			ID:             "F01",
+			Scope:          "Too short.",
+			Description:    "Implement focused behavior for this feature with explicit boundary handling and integration notes for worker execution.",
+			ValidationRefs: []string{"ui.1"},
+		},
 	}
 	issues := validateFeaturesCoverage(features, map[string][]string{"ui": {"ui.1"}})
 	hasScopeIssue := false
@@ -442,7 +452,12 @@ func TestValidateFeaturesCoverage_ShortScope(t *testing.T) {
 
 func TestValidateFeaturesCoverage_EmptyValidationRefs(t *testing.T) {
 	features := []Feature{
-		{ID: "F01", Scope: "Author Zod schemas covering required fields and validation rules across all entities.", ValidationRefs: []string{}},
+		{
+			ID:             "F01",
+			Scope:          "Author Zod schemas covering required fields and validation rules across all entities.",
+			Description:    "Build schema-first foundation, document integration boundaries, and avoid touching unrelated orchestrator status transitions.",
+			ValidationRefs: []string{},
+		},
 	}
 	issues := validateFeaturesCoverage(features, map[string][]string{"ui": {"ui.1"}})
 	hasRefIssue := false
@@ -453,6 +468,140 @@ func TestValidateFeaturesCoverage_EmptyValidationRefs(t *testing.T) {
 	}
 	if !hasRefIssue {
 		t.Errorf("expected empty refs issue, got: %v", issues)
+	}
+}
+
+func TestValidateFeaturesCoverage_MissingDescription(t *testing.T) {
+	features := []Feature{
+		{
+			ID:             "F01",
+			Scope:          "Implement robust parser updates with validation, file path migrations, and integration wiring for worker execution flow.",
+			ValidationRefs: []string{"ui.1"},
+		},
+	}
+	issues := validateFeaturesCoverage(features, map[string][]string{"ui": {"ui.1"}})
+	found := false
+	for _, issue := range issues {
+		if strings.Contains(issue, "empty description") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected missing description issue, got: %v", issues)
+	}
+}
+
+func TestValidateFeaturesCoverage_DescriptionDuplicatesScope(t *testing.T) {
+	scope := "Implement robust parser updates with validation, file path migrations, and integration wiring for worker execution flow."
+	features := []Feature{
+		{
+			ID:             "F01",
+			Scope:          scope,
+			Description:    scope,
+			ValidationRefs: []string{"ui.1"},
+		},
+	}
+	issues := validateFeaturesCoverage(features, map[string][]string{"ui": {"ui.1"}})
+	found := false
+	for _, issue := range issues {
+		if strings.Contains(issue, "duplicates scope") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected duplicate description issue, got: %v", issues)
+	}
+}
+
+func TestBuildChangesDiffPrompt_IncludesCoreArtifacts(t *testing.T) {
+	tmpDir := t.TempDir()
+	specDir := filepath.Join(tmpDir, "spec")
+	missionDir := filepath.Join(specDir, "quest")
+	if err := writeFile(filepath.Join(specDir, "spec.md"), "## Functional Requirements\n\n1. New behavior.\n"); err != nil {
+		t.Fatalf("write spec: %v", err)
+	}
+	if err := writeFile(filepath.Join(missionDir, "features.json"), `{"features":[{"id":"F01"}]}`); err != nil {
+		t.Fatalf("write features: %v", err)
+	}
+	if err := writeFile(filepath.Join(missionDir, "validation-contract.md"), "## ui\n\n- **ui.1: old assertion**\n"); err != nil {
+		t.Fatalf("write contract: %v", err)
+	}
+	if err := writeFile(filepath.Join(missionDir, "knowledge-base.md"), "- note\n"); err != nil {
+		t.Fatalf("write knowledge: %v", err)
+	}
+
+	out := BuildChangesDiffPrompt(specDir, missionDir, tmpDir, false)
+	if !strings.Contains(out, "Analyze the current spec versus current mission artifacts") {
+		t.Fatalf("diff prompt missing analysis directive")
+	}
+	if !strings.Contains(out, "Current Feature State (compact)") || !strings.Contains(out, "Current Validation Contract (compact)") {
+		t.Fatalf("diff prompt missing core artifacts")
+	}
+	if !strings.Contains(out, `"changed_requirements"`) || !strings.Contains(out, `"assertion_impact_ids"`) {
+		t.Fatalf("diff prompt missing structured output schema")
+	}
+}
+
+func TestBuildChangesAssertionsPrompt_UsesDeltaSchema(t *testing.T) {
+	tmpDir := t.TempDir()
+	specDir := filepath.Join(tmpDir, "spec")
+	missionDir := filepath.Join(specDir, "quest")
+	if err := writeFile(filepath.Join(specDir, "spec.md"), "## Functional Requirements\n\n1. Add filter.\n"); err != nil {
+		t.Fatalf("write spec: %v", err)
+	}
+	if err := writeFile(filepath.Join(missionDir, "validation-contract.md"), "## ui\n\n- **ui.1: old assertion**\n"); err != nil {
+		t.Fatalf("write contract: %v", err)
+	}
+
+	out := BuildChangesAssertionsPrompt(
+		specDir,
+		missionDir,
+		tmpDir,
+		`{"changed_requirements":["Add filter"]}`,
+		"",
+		false,
+	)
+	if !strings.Contains(out, `"assertion_delta"`) {
+		t.Fatalf("changes assertions prompt should require assertion_delta output")
+	}
+	if !strings.Contains(out, "Do NOT emit unchanged assertions") {
+		t.Fatalf("changes assertions prompt should guard against full regeneration")
+	}
+}
+
+func TestBuildChangesFeaturesPrompt_UsesDeltaAndAntiOverGenerationGuard(t *testing.T) {
+	tmpDir := t.TempDir()
+	specDir := filepath.Join(tmpDir, "spec")
+	missionDir := filepath.Join(specDir, "quest")
+	if err := writeFile(filepath.Join(specDir, "spec.md"), "## Functional Requirements\n\n1. Add filter.\n"); err != nil {
+		t.Fatalf("write spec: %v", err)
+	}
+	if err := writeFile(filepath.Join(missionDir, "features.json"), `{"features":[{"id":"F01","title":"list"}]}`); err != nil {
+		t.Fatalf("write features: %v", err)
+	}
+	if err := writeFile(filepath.Join(missionDir, "codebase-analysis.md"), "Use existing hooks.\n"); err != nil {
+		t.Fatalf("write analysis: %v", err)
+	}
+
+	out := BuildChangesFeaturesPrompt(
+		specDir,
+		missionDir,
+		tmpDir,
+		map[string][]string{"ui": {"ui.1"}},
+		`{"changed_requirements":["Add filter"]}`,
+		"",
+		false,
+	)
+	if !strings.Contains(out, "Do NOT create unrelated new features") {
+		t.Fatalf("changes features prompt should include anti-over-generation guard")
+	}
+	if !strings.Contains(out, `"feature_delta"`) {
+		t.Fatalf("changes features prompt should require feature_delta output")
+	}
+	if !strings.Contains(out, "Changes Analysis (source of scope)") {
+		t.Fatalf("changes features prompt should include diff scope section")
 	}
 }
 

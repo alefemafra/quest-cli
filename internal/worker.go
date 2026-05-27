@@ -1791,6 +1791,11 @@ func (wp *WorkerPool) runRefinementWithResume(feature Feature, report ValidatorR
 		}
 	}
 
+	rootID := wp.resolveRootFeatureID(feature.ID)
+	if rootID == "" {
+		rootID = feature.ID
+	}
+
 	fixes := ParseFixFeatures(resultText)
 	// #region agent log
 	emitDebugLog(debugRunIDRefineStuckV1, "H1", "internal/worker.go:runRefinementWithResume:parsed", "refinement_parse_result", map[string]any{
@@ -1800,6 +1805,40 @@ func (wp *WorkerPool) runRefinementWithResume(feature Feature, report ValidatorR
 	})
 	// #endregion
 	if len(fixes) == 0 {
+		if shouldWaiveContractOnNoFixes(report, resultText) {
+			targetIDs := []string{feature.ID}
+			if rootID != "" && rootID != feature.ID {
+				targetIDs = append(targetIDs, rootID)
+			}
+			err := wp.markFeaturesWaivedContract(targetIDs)
+			if err == nil {
+				wp.mu.Lock()
+				wp.workers[feature.ID].Status = WorkerFailed
+				wp.workers[feature.ID].EndTime = time.Now()
+				for _, id := range targetIDs {
+					if w, ok := wp.workers[id]; ok {
+						w.Feature.Resolution = ResolutionWaivedContract
+						w.Feature.ResolvedBy = id
+					}
+				}
+				wp.mu.Unlock()
+				wp.updateFeatureStatus(feature.ID, "blocked")
+				if rootID != "" && rootID != feature.ID {
+					wp.updateFeatureStatus(rootID, "blocked")
+				}
+				wp.logger.Log(feature.ID, "Refinement produced no fixes but matched contract-conflict heuristic — marked waived_contract for %s", strings.Join(targetIDs, ", "))
+				wp.eventCh <- WorkerEvent{
+					FeatureID: feature.ID,
+					Role:      "refinement",
+					Done:      true,
+					Line:      fmt.Sprintf("⚠ %s refinement produced no fixes — marked waived_contract (%s)", feature.ID, strings.Join(targetIDs, ", ")),
+				}
+				wp.advanceIfPhaseComplete(feature.Phase, contract)
+				return
+			}
+			wp.logger.Log(feature.ID, "Failed to mark waived_contract after no-fix refinement result: %v", err)
+		}
+
 		wp.logger.Log(feature.ID, "Refinement produced no fix features — marking blocked")
 		wp.mu.Lock()
 		wp.workers[feature.ID].Status = WorkerFailed
@@ -1814,11 +1853,6 @@ func (wp *WorkerPool) runRefinementWithResume(feature Feature, report ValidatorR
 		}
 		wp.advanceIfPhaseComplete(feature.Phase, contract)
 		return
-	}
-
-	rootID := wp.resolveRootFeatureID(feature.ID)
-	if rootID == "" {
-		rootID = feature.ID
 	}
 
 	fixes = wp.rewriteFixFeaturesForRoot(rootID, feature.ID, fixes)
@@ -1942,6 +1976,150 @@ func (wp *WorkerPool) runRefinementWithResume(feature Feature, report ValidatorR
 	}
 
 	go wp.runFixCriticAndStart(feature, fixes, contract)
+}
+
+func shouldWaiveContractOnNoFixes(report ValidatorReport, refinementOutput string) bool {
+	verdict := strings.ToUpper(strings.TrimSpace(report.Verdict))
+	if verdict != "BLOCKED" && verdict != "FAIL" {
+		return false
+	}
+
+	hasBlocked := false
+	for _, assertion := range report.Assertions {
+		result := strings.ToUpper(strings.TrimSpace(assertion.Result))
+		if result == "FAIL" {
+			return false
+		}
+		if result == "BLOCKED" {
+			hasBlocked = true
+		}
+	}
+	if !hasBlocked {
+		return false
+	}
+
+	var evidenceParts []string
+	for _, note := range report.Notes {
+		if strings.TrimSpace(note) != "" {
+			evidenceParts = append(evidenceParts, note)
+		}
+	}
+	for _, assertion := range report.Assertions {
+		if strings.EqualFold(strings.TrimSpace(assertion.Result), "BLOCKED") && strings.TrimSpace(assertion.Evidence) != "" {
+			evidenceParts = append(evidenceParts, assertion.Evidence)
+		}
+	}
+	if strings.TrimSpace(refinementOutput) != "" {
+		evidenceParts = append(evidenceParts, refinementOutput)
+	}
+
+	text := strings.ToLower(strings.Join(evidenceParts, "\n"))
+	if text == "" {
+		return false
+	}
+
+	contextSignals := []string{
+		"contract",
+		"spec",
+		"requirement",
+		"requirements",
+		"fr",
+	}
+	impossibilitySignals := []string{
+		"mis-spec",
+		"mismatch",
+		"contradiction",
+		"by design",
+		"disabled stub",
+		"coming soon",
+		"impossible",
+		"cannot",
+		"can't",
+		"not implementable",
+		"defer",
+	}
+
+	hasContext := false
+	for _, signal := range contextSignals {
+		if strings.Contains(text, signal) {
+			hasContext = true
+			break
+		}
+	}
+	if !hasContext {
+		return false
+	}
+
+	for _, signal := range impossibilitySignals {
+		if strings.Contains(text, signal) {
+			return true
+		}
+	}
+	return false
+}
+
+func (wp *WorkerPool) markFeaturesWaivedContract(featureIDs []string) error {
+	if len(featureIDs) == 0 {
+		return fmt.Errorf("no feature ids provided for waived_contract")
+	}
+
+	path := filepath.Join(wp.missionDir, "features.json")
+	now := time.Now().UTC().Format(time.RFC3339)
+
+	wp.fileMu.Lock()
+	defer wp.fileMu.Unlock()
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+
+	var manifest FeaturesManifest
+	if err := json.Unmarshal(data, &manifest); err != nil {
+		return err
+	}
+
+	targetSet := make(map[string]struct{}, len(featureIDs))
+	for _, id := range featureIDs {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		targetSet[id] = struct{}{}
+	}
+	if len(targetSet) == 0 {
+		return fmt.Errorf("no valid feature ids for waived_contract")
+	}
+
+	seen := make(map[string]bool, len(targetSet))
+	apply := func(features []Feature) {
+		for i := range features {
+			if _, ok := targetSet[features[i].ID]; !ok {
+				continue
+			}
+			features[i].Status = "blocked"
+			features[i].Resolution = ResolutionWaivedContract
+			features[i].ResolvedBy = features[i].ID
+			if features[i].ResolvedAt == "" {
+				features[i].ResolvedAt = now
+			}
+			seen[features[i].ID] = true
+		}
+	}
+	apply(manifest.Features)
+	apply(manifest.FixFeatures)
+
+	for id := range targetSet {
+		if !seen[id] {
+			return fmt.Errorf("feature %s not found for waived_contract", id)
+		}
+	}
+
+	out, err := json.MarshalIndent(manifest, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, out, 0o644)
 }
 
 func (wp *WorkerPool) rewriteFixFeaturesForRoot(rootID, sourceID string, fixes []Feature) []Feature {
@@ -2571,7 +2749,7 @@ func (wp *WorkerPool) checkAllDone() {
 	}
 	wp.mu.Unlock()
 
-	var done, viaFix, failed, tainted int
+	var done, viaFix, waived, failed, tainted int
 	wp.mu.Lock()
 	outcomes := wp.computeFeatureOutcomesLocked()
 	for _, w := range wp.workers {
@@ -2584,7 +2762,11 @@ func (wp *WorkerPool) checkAllDone() {
 		case WorkerFailed:
 			out := outcomes[w.Feature.ID]
 			if out.EffectiveDone {
-				viaFix++
+				if out.Resolution == ResolutionWaivedContract {
+					waived++
+				} else {
+					viaFix++
+				}
 				if out.Resolution == ResolutionResolvedTainted {
 					tainted++
 				}
@@ -2595,10 +2777,10 @@ func (wp *WorkerPool) checkAllDone() {
 	}
 	wp.mu.Unlock()
 
-	wp.logger.Log("", "All phases complete — %d done, %d via fix, %d failed, %d tainted", done, viaFix, failed, tainted)
+	wp.logger.Log("", "All phases complete — %d done, %d via fix, %d waived, %d failed, %d tainted", done, viaFix, waived, failed, tainted)
 	wp.eventCh <- WorkerEvent{
 		AllDone: true,
-		Line:    fmt.Sprintf("✓ Execution complete — %d done, %d via fix, %d failed, %d tainted", done, viaFix, failed, tainted),
+		Line:    fmt.Sprintf("✓ Execution complete — %d done, %d via fix, %d waived, %d failed, %d tainted", done, viaFix, waived, failed, tainted),
 	}
 }
 
@@ -2664,7 +2846,7 @@ func (wp *WorkerPool) updateFeatureStatus(featureID string, status string) {
 			if out.ResolvedBy != "" {
 				features[i].ResolvedBy = out.ResolvedBy
 			}
-			if (out.Resolution == ResolutionResolvedViaFix || out.Resolution == ResolutionResolvedTainted) && features[i].ResolvedAt == "" {
+			if (out.Resolution == ResolutionResolvedViaFix || out.Resolution == ResolutionResolvedTainted || out.Resolution == ResolutionWaivedContract) && features[i].ResolvedAt == "" {
 				features[i].ResolvedAt = now
 			}
 			if out.Resolution == ResolutionOpen || out.Resolution == ResolutionUnresolved {

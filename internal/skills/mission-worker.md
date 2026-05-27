@@ -29,8 +29,9 @@ If an assertion is hard to test automatically (e.g., bot tone, visual UX), docum
 
 ## Scope discipline
 
-- Do ONLY what is described in the feature's `scope` field. Do not refactor adjacent areas. Do not slip in "while we're here" features. Resist.
+- Do ONLY what is described in the feature's `scope` + `description` fields. Do not refactor adjacent areas. Do not slip in "while we're here" features. Resist.
 - If you discover the scope is wrong or incomplete: stop. Document in `docs/specs/<slug>/mission/knowledge-base.md` and report to the orchestrator. Do not improvise.
+- For fix features, treat `root_cause_hypothesis`, `done_when`, `non_goals`, and `regression_guards` as mandatory guardrails.
 
 ## Implementation completeness — MANDATORY checks before ending
 

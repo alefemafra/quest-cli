@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -133,6 +134,10 @@ func ReadMissionState(missionDir string) MissionState {
 				stats.DoneViaFix++
 				stats.BlockedResolved++
 				stats.BlockedTainted++
+			case ResolutionWaivedContract:
+				stats.DoneWaived++
+				stats.BlockedResolved++
+				stats.BlockedWaived++
 			default:
 				stats.BlockedUnresolved++
 			}
@@ -146,7 +151,7 @@ func ReadMissionState(missionDir string) MissionState {
 			stats.Refining++
 		}
 	}
-	stats.Done = stats.DoneDirect + stats.DoneViaFix
+	stats.Done = stats.DoneDirect + stats.DoneViaFix + stats.DoneWaived
 
 	return MissionState{
 		Exists:   true,
@@ -338,6 +343,26 @@ func mergeFeatureExecutionMetadata(existing Feature, planned Feature) Feature {
 	// Preserve runtime status when planner emits empty/pending placeholders.
 	if existing.Status != "" && (planned.Status == "" || planned.Status == "pending") {
 		merged.Status = existing.Status
+	}
+
+	// Preserve planning metadata when planner emits sparse updates.
+	if merged.Description == "" {
+		merged.Description = existing.Description
+	}
+	if merged.RootCauseHypothesis == "" {
+		merged.RootCauseHypothesis = existing.RootCauseHypothesis
+	}
+	if len(merged.Evidence) == 0 {
+		merged.Evidence = existing.Evidence
+	}
+	if len(merged.DoneWhen) == 0 {
+		merged.DoneWhen = existing.DoneWhen
+	}
+	if len(merged.NonGoals) == 0 {
+		merged.NonGoals = existing.NonGoals
+	}
+	if len(merged.RegressionGuards) == 0 {
+		merged.RegressionGuards = existing.RegressionGuards
 	}
 
 	// Preserve v2 resolution metadata unless planner explicitly sets it.
@@ -582,6 +607,446 @@ func ParseAssertionsOnlyJSON(text string) ([]Assertion, bool) {
 		}
 	}
 	return nil, false
+}
+
+func ParseAssertionDeltaJSON(text string) (AssertionDelta, bool) {
+	for _, candidate := range collectJSONCandidates(text) {
+		if delta, ok := parseAssertionDeltaCandidate(candidate); ok {
+			return normalizeAssertionDelta(delta), true
+		}
+	}
+	return AssertionDelta{}, false
+}
+
+func ParseFeatureDeltaJSON(text string) (FeatureDelta, bool) {
+	for _, candidate := range collectJSONCandidates(text) {
+		if delta, ok := parseFeatureDeltaCandidate(candidate); ok {
+			return normalizeFeatureDelta(delta), true
+		}
+	}
+	return FeatureDelta{}, false
+}
+
+func parseAssertionDeltaCandidate(candidate string) (AssertionDelta, bool) {
+	var direct AssertionDelta
+	if err := json.Unmarshal([]byte(candidate), &direct); err == nil &&
+		(len(direct.Upsert) > 0 || len(direct.Remove) > 0 || hasTopLevelJSONKey(candidate, "upsert") || hasTopLevelJSONKey(candidate, "remove")) {
+		return direct, true
+	}
+
+	var wrapped struct {
+		AssertionDelta AssertionDelta `json:"assertion_delta"`
+	}
+	if err := json.Unmarshal([]byte(candidate), &wrapped); err == nil &&
+		(len(wrapped.AssertionDelta.Upsert) > 0 || len(wrapped.AssertionDelta.Remove) > 0 || hasTopLevelJSONKey(candidate, "assertion_delta")) {
+		return wrapped.AssertionDelta, true
+	}
+
+	// Backward compatibility: accept full assertion arrays and treat them as
+	// pure upserts (no removals).
+	var assertions []Assertion
+	if err := json.Unmarshal([]byte(candidate), &assertions); err == nil && len(assertions) > 0 {
+		return assertionDeltaFromAssertions(assertions), true
+	}
+
+	return AssertionDelta{}, false
+}
+
+func parseFeatureDeltaCandidate(candidate string) (FeatureDelta, bool) {
+	var direct FeatureDelta
+	if err := json.Unmarshal([]byte(candidate), &direct); err == nil &&
+		(len(direct.Upsert) > 0 || len(direct.Remove) > 0 || hasTopLevelJSONKey(candidate, "upsert") || hasTopLevelJSONKey(candidate, "remove")) {
+		return direct, true
+	}
+
+	var wrapped struct {
+		FeatureDelta FeatureDelta `json:"feature_delta"`
+	}
+	if err := json.Unmarshal([]byte(candidate), &wrapped); err == nil &&
+		(len(wrapped.FeatureDelta.Upsert) > 0 || len(wrapped.FeatureDelta.Remove) > 0 || hasTopLevelJSONKey(candidate, "feature_delta")) {
+		return wrapped.FeatureDelta, true
+	}
+
+	// Backward compatibility: accept full features outputs and treat them as
+	// pure upserts.
+	var arrayFeatures []Feature
+	if err := json.Unmarshal([]byte(candidate), &arrayFeatures); err == nil && len(arrayFeatures) > 0 {
+		return FeatureDelta{Upsert: arrayFeatures}, true
+	}
+	var obj struct {
+		Features []Feature `json:"features"`
+	}
+	if err := json.Unmarshal([]byte(candidate), &obj); err == nil && len(obj.Features) > 0 {
+		return FeatureDelta{Upsert: obj.Features}, true
+	}
+
+	return FeatureDelta{}, false
+}
+
+func collectJSONCandidates(text string) []string {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return nil
+	}
+
+	var candidates []string
+	appendCandidate := func(v string) {
+		v = strings.TrimSpace(v)
+		if v == "" {
+			return
+		}
+		for _, existing := range candidates {
+			if existing == v {
+				return
+			}
+		}
+		candidates = append(candidates, v)
+	}
+
+	appendCandidate(text)
+
+	re := regexp.MustCompile("(?s)```(?:json)?\\s*\\n(.*?)\\n```")
+	for _, match := range re.FindAllStringSubmatch(text, -1) {
+		if len(match) > 1 {
+			appendCandidate(match[1])
+		}
+	}
+
+	appendCandidate(extractFirstBalancedBlock(text, '{', '}'))
+	appendCandidate(extractFirstBalancedBlock(text, '[', ']'))
+
+	return candidates
+}
+
+func extractFirstBalancedBlock(text string, open, close byte) string {
+	start := strings.IndexByte(text, open)
+	if start < 0 {
+		return ""
+	}
+	depth := 0
+	for i := start; i < len(text); i++ {
+		switch text[i] {
+		case open:
+			depth++
+		case close:
+			depth--
+			if depth == 0 {
+				return text[start : i+1]
+			}
+		}
+	}
+	return ""
+}
+
+func hasTopLevelJSONKey(candidate, key string) bool {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(candidate), &raw); err != nil {
+		return false
+	}
+	_, ok := raw[key]
+	return ok
+}
+
+func assertionDeltaFromAssertions(assertions []Assertion) AssertionDelta {
+	var upsert []AssertionDeltaItem
+	for _, a := range assertions {
+		category := strings.TrimSpace(a.Category)
+		for _, item := range a.Items {
+			id := extractAssertionID(item)
+			if id == "" {
+				continue
+			}
+			upsert = append(upsert, AssertionDeltaItem{
+				ID:        id,
+				Category:  category,
+				Assertion: item,
+			})
+		}
+	}
+	return AssertionDelta{Upsert: upsert}
+}
+
+func normalizeAssertionDelta(delta AssertionDelta) AssertionDelta {
+	norm := AssertionDelta{}
+
+	removeSeen := make(map[string]struct{})
+	for _, id := range delta.Remove {
+		id = normalizeAssertionID(id)
+		if id == "" {
+			continue
+		}
+		key := strings.ToLower(id)
+		if _, ok := removeSeen[key]; ok {
+			continue
+		}
+		removeSeen[key] = struct{}{}
+		norm.Remove = append(norm.Remove, id)
+	}
+
+	upsertSeen := make(map[string]int)
+	for _, item := range delta.Upsert {
+		id := normalizeAssertionID(item.ID)
+		if id == "" {
+			id = extractAssertionID(item.Assertion)
+		}
+		if id == "" {
+			continue
+		}
+		category := strings.TrimSpace(item.Category)
+		if category == "" {
+			category = assertionCategoryFromID(id)
+		}
+		text := formatAssertionText(id, item.Assertion)
+		next := AssertionDeltaItem{ID: id, Category: category, Assertion: text}
+		key := strings.ToLower(id)
+		if idx, exists := upsertSeen[key]; exists {
+			norm.Upsert[idx] = next
+			continue
+		}
+		upsertSeen[key] = len(norm.Upsert)
+		norm.Upsert = append(norm.Upsert, next)
+	}
+
+	return norm
+}
+
+func normalizeFeatureDelta(delta FeatureDelta) FeatureDelta {
+	norm := FeatureDelta{}
+	removeSeen := make(map[string]struct{})
+	for _, id := range delta.Remove {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		key := strings.ToLower(id)
+		if _, ok := removeSeen[key]; ok {
+			continue
+		}
+		removeSeen[key] = struct{}{}
+		norm.Remove = append(norm.Remove, id)
+	}
+
+	upsertSeen := make(map[string]int)
+	for _, f := range delta.Upsert {
+		f.ID = strings.TrimSpace(f.ID)
+		if f.ID == "" {
+			continue
+		}
+		if f.Status == "" {
+			f.Status = "pending"
+		}
+		key := strings.ToLower(f.ID)
+		if idx, exists := upsertSeen[key]; exists {
+			norm.Upsert[idx] = f
+			continue
+		}
+		upsertSeen[key] = len(norm.Upsert)
+		norm.Upsert = append(norm.Upsert, f)
+	}
+
+	return norm
+}
+
+func ApplyAssertionDelta(existing []Assertion, delta AssertionDelta) []Assertion {
+	type assertionRecord struct {
+		ID       string
+		Category string
+		Text     string
+	}
+
+	records := make(map[string]assertionRecord)
+	for _, group := range existing {
+		category := strings.TrimSpace(group.Category)
+		for _, item := range group.Items {
+			id := extractAssertionID(item)
+			if id == "" {
+				continue
+			}
+			key := strings.ToLower(id)
+			records[key] = assertionRecord{
+				ID:       id,
+				Category: category,
+				Text:     formatAssertionText(id, item),
+			}
+		}
+	}
+
+	delta = normalizeAssertionDelta(delta)
+	for _, id := range delta.Remove {
+		delete(records, strings.ToLower(id))
+	}
+	for _, item := range delta.Upsert {
+		key := strings.ToLower(item.ID)
+		records[key] = assertionRecord{
+			ID:       item.ID,
+			Category: strings.TrimSpace(item.Category),
+			Text:     formatAssertionText(item.ID, item.Assertion),
+		}
+	}
+
+	byCategory := make(map[string][]assertionRecord)
+	for _, rec := range records {
+		category := strings.TrimSpace(rec.Category)
+		if category == "" {
+			category = assertionCategoryFromID(rec.ID)
+		}
+		rec.Category = category
+		byCategory[category] = append(byCategory[category], rec)
+	}
+
+	categories := make([]string, 0, len(byCategory))
+	for category := range byCategory {
+		categories = append(categories, category)
+	}
+	sort.Strings(categories)
+
+	merged := make([]Assertion, 0, len(categories))
+	for _, category := range categories {
+		items := byCategory[category]
+		sort.Slice(items, func(i, j int) bool {
+			return assertionIDLess(items[i].ID, items[j].ID)
+		})
+		group := Assertion{Category: category, Items: make([]string, 0, len(items))}
+		for _, item := range items {
+			group.Items = append(group.Items, item.Text)
+		}
+		if len(group.Items) > 0 {
+			merged = append(merged, group)
+		}
+	}
+
+	return merged
+}
+
+func ApplyFeatureDelta(existing []Feature, delta FeatureDelta, preserveDone bool) []Feature {
+	delta = normalizeFeatureDelta(delta)
+	records := make(map[string]Feature, len(existing))
+	for _, feature := range existing {
+		id := strings.TrimSpace(feature.ID)
+		if id == "" {
+			continue
+		}
+		feature.ID = id
+		records[strings.ToLower(id)] = feature
+	}
+
+	removeSet := make(map[string]struct{}, len(delta.Remove))
+	for _, id := range delta.Remove {
+		key := strings.ToLower(strings.TrimSpace(id))
+		if key != "" {
+			removeSet[key] = struct{}{}
+		}
+	}
+
+	for key := range removeSet {
+		if feature, exists := records[key]; exists {
+			if preserveDone && isTerminalFeatureStatus(feature.Status) {
+				continue
+			}
+			delete(records, key)
+		}
+	}
+
+	for _, next := range delta.Upsert {
+		key := strings.ToLower(next.ID)
+		if existingFeature, exists := records[key]; exists {
+			if preserveDone && isTerminalFeatureStatus(existingFeature.Status) {
+				continue
+			}
+			records[key] = mergeFeatureExecutionMetadata(existingFeature, next)
+			continue
+		}
+		records[key] = next
+	}
+
+	merged := make([]Feature, 0, len(records))
+	for _, feature := range records {
+		merged = append(merged, feature)
+	}
+	sort.Slice(merged, func(i, j int) bool {
+		if merged[i].Phase != merged[j].Phase {
+			return merged[i].Phase < merged[j].Phase
+		}
+		return merged[i].ID < merged[j].ID
+	})
+	return merged
+}
+
+func isTerminalFeatureStatus(status string) bool {
+	switch strings.TrimSpace(status) {
+	case "done", "validated":
+		return true
+	default:
+		return false
+	}
+}
+
+func extractAssertionID(item string) string {
+	re := regexp.MustCompile(`^\s*([a-zA-Z][a-zA-Z0-9_-]*\.\d+)`)
+	match := re.FindStringSubmatch(strings.TrimSpace(item))
+	if len(match) < 2 {
+		return ""
+	}
+	return strings.TrimSpace(match[1])
+}
+
+func normalizeAssertionID(id string) string {
+	id = strings.TrimSpace(strings.TrimSuffix(id, ":"))
+	if id == "" {
+		return ""
+	}
+	re := regexp.MustCompile(`([a-zA-Z][a-zA-Z0-9_-]*\.\d+)`)
+	if match := re.FindStringSubmatch(id); len(match) >= 2 {
+		return strings.TrimSpace(match[1])
+	}
+	return ""
+}
+
+func assertionCategoryFromID(id string) string {
+	if idx := strings.Index(id, "."); idx > 0 {
+		return strings.TrimSpace(id[:idx])
+	}
+	return ""
+}
+
+func formatAssertionText(id, body string) string {
+	text := strings.TrimSpace(body)
+	if text == "" {
+		return id + ":"
+	}
+	if parts := strings.SplitN(text, ":", 2); len(parts) == 2 {
+		prefix := normalizeAssertionID(parts[0])
+		if prefix != "" && strings.EqualFold(prefix, id) {
+			return fmt.Sprintf("%s: %s", id, strings.TrimSpace(parts[1]))
+		}
+	}
+	return fmt.Sprintf("%s: %s", id, strings.TrimLeft(text, ": "))
+}
+
+func assertionIDLess(a, b string) bool {
+	catA := assertionCategoryFromID(a)
+	catB := assertionCategoryFromID(b)
+	if catA != catB {
+		return catA < catB
+	}
+	numA := assertionIDNumber(a)
+	numB := assertionIDNumber(b)
+	if numA != numB {
+		return numA < numB
+	}
+	return a < b
+}
+
+func assertionIDNumber(id string) int {
+	parts := strings.Split(id, ".")
+	if len(parts) < 2 {
+		return 0
+	}
+	n, err := strconv.Atoi(parts[len(parts)-1])
+	if err != nil {
+		return 0
+	}
+	return n
 }
 
 // ParseFeaturesOnlyJSON is the v3 Phase Features parser: expects either

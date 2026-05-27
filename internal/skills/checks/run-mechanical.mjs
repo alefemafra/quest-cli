@@ -19,6 +19,7 @@ function parseArgs() {
           '\n' +
           'Runs all [M] mechanical critique checks against a Missions project.\n' +
           '--root sets the project root for CLAUDE.md (defaults to --project).\n' +
+          'Set MISSION_FIX_METADATA_STRICT=1 to make new fix metadata checks blocking.\n' +
           'Exit code: 0 = all pass, 1 = at least one fail.\n'
       );
       process.exit(0);
@@ -29,6 +30,7 @@ function parseArgs() {
 }
 
 const results = [];
+const strictFixMetadata = process.env.MISSION_FIX_METADATA_STRICT === '1';
 
 function record(id, category, status, message, opts = {}) {
   results.push({ id, category, status, message, ...opts });
@@ -338,6 +340,24 @@ function checkDecomposition(project, assertions, artifactDir) {
     );
   }
 
+  const missingDescriptions = allFeatures
+    .map(f => ({ id: f.id || '(no id)', description: typeof f.description === 'string' ? f.description.trim() : '' }))
+    .filter(f => f.description.length === 0)
+    .map(f => f.id);
+  if (missingDescriptions.length === 0) {
+    record('M-D8', 'decomposition', 'pass', 'all features include non-empty description');
+  } else {
+    const status = strictFixMetadata ? 'fail' : 'pass';
+    const head = missingDescriptions.slice(0, 8).join(', ');
+    const msgPrefix = strictFixMetadata ? '' : 'advisory: ';
+    record(
+      'M-D8',
+      'decomposition',
+      status,
+      `${msgPrefix}${missingDescriptions.length} feature(s) missing description: ${head}${missingDescriptions.length > 8 ? ', ...' : ''}`
+    );
+  }
+
   const rootIdRe = /^F\d+[a-z]?$/;
   const fixIdRe = /^F\d+[a-z]?(?:-fix-\d+)+$/;
   const badRootIDs = features.filter(f => !rootIdRe.test(f.id || ''));
@@ -458,6 +478,41 @@ function checkDecomposition(project, assertions, artifactDir) {
         `${bad.length} feature(s) with status outside lifecycle: ${bad.map(f => `${f.id}=${f.status}`).join(', ')}`
       );
     }
+  }
+
+  const fixMetadataIssues = [];
+  for (const f of fixFeatures) {
+    const id = f.id || '(no id)';
+    if (typeof f.root_cause_hypothesis !== 'string' || f.root_cause_hypothesis.trim() === '') {
+      fixMetadataIssues.push(`${id}: missing root_cause_hypothesis`);
+    }
+    if (!Array.isArray(f.evidence) || f.evidence.length === 0) {
+      fixMetadataIssues.push(`${id}: missing evidence[]`);
+    }
+    if (!Array.isArray(f.done_when) || f.done_when.length === 0) {
+      fixMetadataIssues.push(`${id}: missing done_when[]`);
+    }
+    if (!Array.isArray(f.non_goals) || f.non_goals.length === 0) {
+      fixMetadataIssues.push(`${id}: missing non_goals[]`);
+    }
+    if (!Array.isArray(f.regression_guards) || f.regression_guards.length === 0) {
+      fixMetadataIssues.push(`${id}: missing regression_guards[]`);
+    }
+  }
+  if (fixFeatures.length === 0) {
+    record('M-D9', 'decomposition', 'pass', 'no fix_features present (metadata check skipped)');
+  } else if (fixMetadataIssues.length === 0) {
+    record('M-D9', 'decomposition', 'pass', 'all fix_features include root-cause and regression metadata');
+  } else {
+    const status = strictFixMetadata ? 'fail' : 'pass';
+    const preview = fixMetadataIssues.slice(0, 8).join('; ');
+    const msgPrefix = strictFixMetadata ? '' : 'advisory: ';
+    record(
+      'M-D9',
+      'decomposition',
+      status,
+      `${msgPrefix}${fixMetadataIssues.length} fix metadata issue(s): ${preview}${fixMetadataIssues.length > 8 ? '; ...' : ''}`
+    );
   }
 }
 

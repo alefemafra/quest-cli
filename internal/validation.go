@@ -129,6 +129,24 @@ func validateFeaturesCoverage(features []Feature, knownIDs map[string][]string) 
 				"Feature %s scope is too short (%d chars: '%s'). Specify schemas, validation, file paths.",
 				fid, len(scope), truncatePreview(scope, 60)))
 		}
+
+		description := strings.TrimSpace(f.Description)
+		if description == "" {
+			issues = append(issues, fmt.Sprintf(
+				"Feature %s has empty description. Add intent, boundaries, and implementation notes.",
+				fid))
+		} else {
+			if len(description) < 120 {
+				issues = append(issues, fmt.Sprintf(
+					"Feature %s description is too short (%d chars: '%s'). Explain intent, boundaries, and pitfalls.",
+					fid, len(description), truncatePreview(description, 70)))
+			}
+			if looselySameText(scope, description) {
+				issues = append(issues, fmt.Sprintf(
+					"Feature %s description duplicates scope. Use description for rationale/boundaries, not repetition.",
+					fid))
+			}
+		}
 	}
 
 	return issues
@@ -203,6 +221,21 @@ func assertionsCombinedText(assertions []Assertion) string {
 		}
 	}
 	return b.String()
+}
+
+var collapseWhitespaceRe = regexp.MustCompile(`\s+`)
+var stripPunctuationRe = regexp.MustCompile(`[^a-z0-9\s]+`)
+
+func looselySameText(a, b string) bool {
+	normalize := func(s string) string {
+		s = strings.ToLower(strings.TrimSpace(s))
+		s = stripPunctuationRe.ReplaceAllString(s, " ")
+		s = collapseWhitespaceRe.ReplaceAllString(s, " ")
+		return strings.TrimSpace(s)
+	}
+	na := normalize(a)
+	nb := normalize(b)
+	return na != "" && nb != "" && na == nb
 }
 
 var endpointHappyRe = regexp.MustCompile(`(?i)\b(2\d{2}|201|200|204|created|success|returns|persisted)\b`)
