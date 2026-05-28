@@ -10,6 +10,8 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"syscall"
+	"time"
 )
 
 var transientStreamPatterns = []string{
@@ -41,6 +43,7 @@ func StartClaude(prompt, cwd string, verbose *bool, ch chan ClaudeStreamMsg, ext
 	}
 	cmd := exec.Command("claude", args...)
 	cmd.Dir = cwd
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -103,6 +106,9 @@ func StartClaude(prompt, cwd string, verbose *bool, ch chan ClaudeStreamMsg, ext
 		}
 
 		waitErr := cmd.Wait()
+		// Kill any orphaned children (MCP servers) left in the process group
+		go cleanupProcessGroup(cmd.Process.Pid)
+
 		if waitErr != nil {
 			if resultText != "" && streamError == "" {
 				ch <- ClaudeStreamMsg{Done: true, Result: resultText, SessionID: sessionID}
@@ -128,10 +134,31 @@ func StartClaude(prompt, cwd string, verbose *bool, ch chan ClaudeStreamMsg, ext
 	return cmd
 }
 
+// StopClaude kills the claude process and all its children (MCP servers, etc.)
+// by sending SIGTERM to the entire process group, then SIGKILL after a short
+// grace period to catch lingering children.
 func StopClaude(cmd *exec.Cmd) {
-	if cmd != nil && cmd.Process != nil {
-		_ = cmd.Process.Kill()
+	if cmd == nil || cmd.Process == nil {
+		return
 	}
+	killProcessGroup(cmd.Process.Pid)
+}
+
+// killProcessGroup sends SIGTERM to a process group, waits briefly, then SIGKILL.
+func killProcessGroup(pid int) {
+	_ = syscall.Kill(-pid, syscall.SIGTERM)
+	go func() {
+		time.Sleep(3 * time.Second)
+		_ = syscall.Kill(-pid, syscall.SIGKILL)
+	}()
+}
+
+// cleanupProcessGroup sends SIGTERM+SIGKILL to a process group to kill any
+// orphaned children (e.g. MCP servers) left after the leader exits normally.
+func cleanupProcessGroup(pid int) {
+	_ = syscall.Kill(-pid, syscall.SIGTERM)
+	time.Sleep(1 * time.Second)
+	_ = syscall.Kill(-pid, syscall.SIGKILL)
 }
 
 type streamParser struct {

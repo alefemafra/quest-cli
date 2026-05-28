@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -350,12 +351,23 @@ func (wp *WorkerPool) Stop() {
 	defer wp.mu.Unlock()
 	wp.stopped = true
 
+	var pids []int
 	for _, w := range wp.workers {
-		if (w.Status == WorkerRunning || w.Status == WorkerAwaitingValidation || w.Status == WorkerValidating || w.Status == WorkerRefining) && w.cmd != nil {
-			_ = w.cmd.Process.Kill()
+		if (w.Status == WorkerRunning || w.Status == WorkerAwaitingValidation || w.Status == WorkerValidating || w.Status == WorkerRefining) && w.cmd != nil && w.cmd.Process != nil {
+			pid := w.cmd.Process.Pid
+			_ = syscall.Kill(-pid, syscall.SIGTERM)
+			pids = append(pids, pid)
 			w.Status = WorkerFailed
 			w.EndTime = time.Now()
 		}
+	}
+	if len(pids) > 0 {
+		go func() {
+			time.Sleep(3 * time.Second)
+			for _, pid := range pids {
+				_ = syscall.Kill(-pid, syscall.SIGKILL)
+			}
+		}()
 	}
 	wp.logger.Log("", "Execution stopped by user")
 }
