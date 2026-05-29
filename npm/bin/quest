@@ -1,3 +1,9 @@
 #!/usr/bin/env sh
-basedir=$(dirname "$(echo "$0" | sed -e 's,\\,/,g')")
+self="$0"
+while [ -L "$self" ]; do
+  dir=$(cd "$(dirname "$self")" && pwd)
+  self=$(readlink "$self")
+  case "$self" in /*) ;; *) self="$dir/$self" ;; esac
+done
+basedir=$(cd "$(dirname "$self")" && pwd)
 exec "$basedir/../vendor/quest" "$@"
