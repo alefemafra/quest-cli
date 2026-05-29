@@ -20,10 +20,12 @@ quest --version           # Show version
 quest --help              # Show help
 ```
 
-## Requirements
+## Supported Platforms
 
-- Node.js >= 16 (for installation only)
-- macOS (arm64, x64), Linux (arm64, x64), or Windows (x64)
+- macOS (Apple Silicon, Intel)
+- Linux (arm64, x64)
+
+Windows is not supported yet.
 
 ## License
 
